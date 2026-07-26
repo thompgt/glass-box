@@ -34,6 +34,7 @@ from pyiceberg.expressions import EqualTo
 
 from ..explain.dispatch import Explanation, expected_total, link_for_module
 from ..schemas import ATTRIBUTIONS, DATA_SNAPSHOTS, MODEL_VERSIONS, PREDICTIONS
+from ..train.features import CATEGORICAL_FEATURES, FEATURE_COLUMNS
 from ..train.registry import ProvenanceIntegrityError
 
 DEFAULT_TOP_K = 10
@@ -52,6 +53,21 @@ class ExplanationNotFoundError(LookupError):
 
 @dataclass
 class AttributionView:
+    """One encoded column's contribution, rendered for the person it is about.
+
+    The stored row is an *encoded* column — ``cat__sex_Female`` — paired with the
+    subject's actual value for the source feature. Printed together those read as
+    nonsense: "sex_Female = Male". Worse, they read as a claim about the subject
+    that is false.
+
+    A one-hot expansion produces one column per category, and the ones the
+    subject does *not* fall into still carry a nonzero attribution: a zero in that
+    column differs from the training population's average, and that difference
+    moves the score. Suppressing them would break additivity; mislabelling them
+    misleads the reader. So they are kept and stated for what they are — "sex is
+    not Female" — with :attr:`applies` marking which are the subject's own.
+    """
+
     feature_name: str
     feature_value_str: str | None
     shap_value: float
@@ -61,6 +77,37 @@ class AttributionView:
     def direction(self) -> str:
         """Which way this feature pushed the decision, in plain words."""
         return "toward approval" if self.shap_value > 0 else "toward denial"
+
+    @property
+    def source_feature(self) -> str:
+        """The real-world feature behind the encoded column: ``sex``, ``age``."""
+        return _decode_column(self.feature_name)[0]
+
+    @property
+    def encoded_category(self) -> str | None:
+        """The category this column tests for, or ``None`` for a numeric column."""
+        return _decode_column(self.feature_name)[1]
+
+    @property
+    def applies(self) -> bool:
+        """Is this the subject's own category?
+
+        False for the one-hot columns of a category they do not belong to. Those
+        contribute to the score and so must be reported, but a reader has to be
+        able to tell them apart from the ones describing this person.
+        """
+        category = self.encoded_category
+        return category is None or category == self.feature_value_str
+
+    @property
+    def statement(self) -> str:
+        """What this column asserts about the subject, in words they can check."""
+        category = self.encoded_category
+        if category is None:
+            return f"{self.source_feature} = {self.feature_value_str}"
+        if self.applies:
+            return f"{self.source_feature} = {category}"
+        return f"{self.source_feature} is not {category}"
 
 
 @dataclass
@@ -122,8 +169,13 @@ class ExplanationReport:
                 "link": self.link,
                 "attributions": [
                     {
+                        # The encoded column, kept so the response can be tied
+                        # back to the stored row it came from.
                         "feature_name": a.feature_name,
                         "feature_value": a.feature_value_str,
+                        "source_feature": a.source_feature,
+                        "statement": a.statement,
+                        "applies_to_subject": a.applies,
                         "shap_value": a.shap_value,
                         "abs_rank": a.abs_rank,
                         "direction": a.direction,
@@ -248,6 +300,28 @@ def _check_reconciliation(report: ExplanationReport, prediction_id: str) -> None
             f"implies {want!r} in {report.link} space. The audit trail for this "
             f"decision is not internally consistent."
         )
+
+
+def _decode_column(encoded_name: str) -> tuple[str, str | None]:
+    """Split an encoded column name into ``(source_feature, category)``.
+
+    ``ColumnTransformer`` emits ``num__age`` and ``cat__marital_status_Divorced``.
+    The categorical form is ambiguous by construction — the separator between the
+    feature and the category is the same underscore that appears inside both — so
+    the split is resolved against the known feature list, longest name first.
+    Guessing at the last underscore would turn ``marital_status_Divorced`` into
+    feature ``marital`` and category ``status_Divorced``.
+    """
+    name = encoded_name.split("__", 1)[-1]
+
+    if name in FEATURE_COLUMNS:
+        return name, None
+
+    for column in sorted(CATEGORICAL_FEATURES, key=len, reverse=True):
+        if name.startswith(f"{column}_"):
+            return column, name[len(column) + 1 :]
+
+    return name, None
 
 
 def _link_for(explainer_type: str, estimator_class: str) -> str:

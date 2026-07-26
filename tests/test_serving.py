@@ -180,6 +180,47 @@ def test_the_served_attribution_is_the_one_that_was_recorded(service):
     assert report.base_value == pytest.approx(outcome.explanation.base_value)
 
 
+def test_a_one_hot_column_the_subject_is_not_in_says_so(service):
+    """'sex_Female = Male' is not an explanation, it is a false claim.
+
+    Those columns carry real attribution — a zero differs from the training
+    population's average and moves the score — so they cannot be dropped without
+    breaking additivity. They are stated for what they are instead.
+    """
+    outcome = service.predict({**APPLICANT, "sex": "Male"})
+    service.flush()
+
+    report = explanation_for(service.catalog, outcome.prediction_id, top_k=200)
+    by_name = {a.feature_name: a for a in report.attributions}
+
+    mine = by_name["cat__sex_Male"]
+    assert mine.applies
+    assert mine.statement == "sex = Male"
+
+    not_mine = by_name["cat__sex_Female"]
+    assert not not_mine.applies
+    assert not_mine.statement == "sex is not Female"
+
+    numeric = by_name["num__age"]
+    assert numeric.applies
+    assert numeric.statement.startswith("age = ")
+
+
+def test_a_feature_name_containing_an_underscore_is_split_correctly(service):
+    """``marital_status_Divorced`` must not become feature 'marital'."""
+    outcome = service.predict({**APPLICANT, "marital_status": "Divorced"})
+    service.flush()
+
+    report = explanation_for(service.catalog, outcome.prediction_id, top_k=200)
+    column = next(
+        a for a in report.attributions if a.feature_name == "cat__marital_status_Divorced"
+    )
+
+    assert column.source_feature == "marital_status"
+    assert column.encoded_category == "Divorced"
+    assert column.statement == "marital_status = Divorced"
+
+
 def test_attributions_report_the_direction_they_pushed_the_decision(service):
     outcome = service.predict(APPLICANT)
     service.flush()
