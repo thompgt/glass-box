@@ -105,25 +105,34 @@ def explainer_for(model):
     )
 
 
-def link_of(model, explainer_type: str) -> str:
-    """The output space of this (explainer, model family) pair.
+def link_for_module(module: str, explainer_type: str) -> str:
+    """The output space of an (explainer, estimator module) pair.
 
     ``"logit"`` means the attributions sum to ``logit(predict_proba)``;
     ``"identity"`` means they sum to ``predict_proba`` directly. Getting this
     wrong does not produce a slightly-off check — it produces a check that fails
     on every correct explanation, so it is resolved explicitly rather than
     assumed.
+
+    Keyed on the module *name* rather than a live estimator so that the audit
+    read path, which has only the recorded ``estimator_class`` string and no
+    model in memory, resolves the link through this same rule. Two copies of this
+    logic would eventually disagree, and the disagreement would look like a
+    corrupt audit trail rather than like a bug.
     """
     if explainer_type == "linear":
         return "logit"
-
-    module = type(final_estimator(model)).__module__
     if module.startswith(("sklearn.ensemble", "sklearn.tree")):
         # A forest's raw output is the averaged class probability, so
         # TreeExplainer's values are already in probability space.
         return "identity"
     # LightGBM and XGBoost binary boosters sum raw margins: log-odds.
     return "logit"
+
+
+def link_of(model, explainer_type: str) -> str:
+    """:func:`link_for_module` for a live model."""
+    return link_for_module(type(final_estimator(model)).__module__, explainer_type)
 
 
 def encoded_feature_names(model) -> list[str]:
