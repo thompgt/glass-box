@@ -150,8 +150,20 @@ def register(
         registered_name=registered_name,
         status=status,
     )
-    append_records(catalog, MODEL_VERSIONS, [mv.to_record()])
+    # Membership first, the model_versions row last. Same reasoning as
+    # MLflow-before-Iceberg above, applied one level down: if the process dies
+    # between these two commits, the surviving state must be the one that fails
+    # safe.
+    #
+    # Membership is the erasure contamination index, and it is read
+    # subject -> model_version_ids. Orphaned membership rows make an erasure
+    # report name a model version that does not exist, which over-reports
+    # contamination. The reverse order leaves a registered, servable model
+    # version with no membership rows, and that under-reports: a subject whose
+    # data trained the model is told it did not. Over-reporting is an
+    # investigation; under-reporting is a false assurance to a data subject.
     _write_membership(catalog, model_version_id, train_subject_ids, eval_subject_ids)
+    append_records(catalog, MODEL_VERSIONS, [mv.to_record()])
     return mv
 
 

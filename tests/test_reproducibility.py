@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from glassbox.ingest import ingest_adult
-from glassbox.schemas import CREDIT_APPLICATIONS, TRAINING_MEMBERSHIP
+from glassbox.schemas import CREDIT_APPLICATIONS, MODEL_VERSIONS, TRAINING_MEMBERSHIP
 from glassbox.train import features as F
 from glassbox.train import train_baseline
 from glassbox.train.canonical import UnsupportedModelError, model_digest
@@ -157,6 +157,35 @@ def test_training_membership_is_materialized_for_every_subject(trained, catalog)
 
     ids = mine["subject_id"].to_pylist()
     assert len(ids) == len(set(ids)), "a subject must appear once per model version"
+
+
+def test_membership_is_committed_before_the_model_version_row(catalog, adult_file, gb_root):
+    """Crashing between the two commits must fail toward over-reporting.
+
+    Membership is the erasure contamination index, read subject -> models. An
+    orphaned membership row names a model version that does not exist, which
+    over-reports contamination and gets investigated. The reverse order leaves a
+    registered, servable model version with no membership rows, and tells a
+    subject whose data trained it that it did not. One is an investigation, the
+    other is a false assurance.
+    """
+    import glassbox.train.registry as reg
+
+    ingest_adult(gb_root)
+    order: list[str] = []
+    real = reg.append_records
+
+    def spy(catalog, td, records):
+        order.append(td.name)
+        return real(catalog, td, records)
+
+    reg.append_records = spy
+    try:
+        train_baseline(root=gb_root)
+    finally:
+        reg.append_records = real
+
+    assert order.index(TRAINING_MEMBERSHIP.name) < order.index(MODEL_VERSIONS.name)
 
 
 def test_load_model_checked_fails_closed_on_digest_mismatch(trained, catalog, gb_root):

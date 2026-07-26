@@ -189,6 +189,15 @@ MODEL_VERSIONS = TableDef(
 # Materialized at training time and never reconstructed. After a snapshot is
 # expired you *cannot* recover membership by time travel, because the rows are
 # gone — which is precisely the moment an erasure request needs the answer.
+#
+# This table has the deepest paths in the warehouse: two partition levels, the
+# first of which is a 36-character UUID, plus PyIceberg's ~45-character data file
+# names. That is ~150 characters below the warehouse root, so on Windows a root
+# deeper than roughly 110 characters exceeds MAX_PATH and the write fails with a
+# bare FileNotFoundError naming the parquet file. It is a platform limit rather
+# than a schema flaw — bucketing on subject_id is what bounds erasure cost — but
+# it is the reason `register()` commits these rows *before* the model_versions
+# row: the failure has to leave the state that over-reports contamination.
 TRAINING_MEMBERSHIP = TableDef(
     identifier=(AUDIT_NS, "training_membership"),
     schema=Schema(
