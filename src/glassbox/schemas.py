@@ -176,6 +176,11 @@ MODEL_VERSIONS = TableDef(
         NestedField(16, "status", StringType(), required=True),
         NestedField(17, "retired_at", TimestamptzType(), required=False),
         NestedField(18, "retire_reason", StringType(), required=False),
+        # Names the training procedure, so reproduction knows which trainer to
+        # re-run. estimator_class is not enough: FLAML and the baseline can both
+        # produce a LogisticRegression, but re-running the wrong one would
+        # reproduce a different model and report it as a mismatch.
+        NestedField(19, "recipe", StringType(), required=True),
         identifier_field_ids=[1],
     ),
     properties=DEFAULT_PROPERTIES,
