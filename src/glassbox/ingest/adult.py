@@ -33,6 +33,8 @@ from pathlib import Path
 import pyarrow as pa
 
 from ..digest import row_digest
+from ..schemas import CREDIT_APPLICATIONS
+from ..writer import arrow_schema_for, records_to_arrow
 
 # Mirrors, tried in order. The UCI site has moved once already; a local cache in
 # data/raw/ means this only has to work the first time.
@@ -190,40 +192,13 @@ def parse_adult(path: Path, ingest_batch_id: str) -> pa.Table:
 def arrow_schema() -> pa.Schema:
     """Arrow schema matching ``features.credit_applications`` exactly.
 
-    Built by hand rather than inferred because PyIceberg validates incoming Arrow
-    schemas strictly: ``timestamp[ns]`` (pandas' default) and ``large_string``
-    (Polars' default) are both rejected against ``timestamptz`` and ``string``.
-    Every write path goes through this schema so those mismatches cannot occur.
+    Derived from the Iceberg schema rather than hand-written. Phase 0 measured
+    that PyIceberg rejects both ``timestamp[ns]`` (pandas' default) and
+    ``large_string`` (Polars' default) on write, and a hand-written schema is one
+    more thing that can silently drift from the table it targets.
     """
-    return pa.schema(
-        [
-            pa.field("subject_id", pa.string(), nullable=False),
-            pa.field("as_of_ts", pa.timestamp("us", tz="UTC"), nullable=False),
-            pa.field("ingest_batch_id", pa.string(), nullable=False),
-            pa.field("source_row_digest", pa.string(), nullable=False),
-            pa.field("split", pa.string(), nullable=False),
-            pa.field("age", pa.int32(), nullable=True),
-            pa.field("workclass", pa.string(), nullable=True),
-            pa.field("fnlwgt", pa.int32(), nullable=True),
-            pa.field("education", pa.string(), nullable=True),
-            pa.field("education_num", pa.int32(), nullable=True),
-            pa.field("marital_status", pa.string(), nullable=True),
-            pa.field("occupation", pa.string(), nullable=True),
-            pa.field("relationship", pa.string(), nullable=True),
-            pa.field("race", pa.string(), nullable=True),
-            pa.field("sex", pa.string(), nullable=True),
-            pa.field("capital_gain", pa.int32(), nullable=True),
-            pa.field("capital_loss", pa.int32(), nullable=True),
-            pa.field("hours_per_week", pa.int32(), nullable=True),
-            pa.field("native_country", pa.string(), nullable=True),
-            pa.field("label", pa.int32(), nullable=False),
-        ]
-    )
+    return arrow_schema_for(CREDIT_APPLICATIONS)
 
 
 def _to_arrow(records: list[dict]) -> pa.Table:
-    schema = arrow_schema()
-    columns = {
-        f.name: pa.array([r.get(f.name) for r in records], type=f.type) for f in schema
-    }
-    return pa.table(columns, schema=schema)
+    return records_to_arrow(CREDIT_APPLICATIONS, records)

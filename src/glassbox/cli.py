@@ -39,6 +39,30 @@ def init_cmd() -> None:
     console.print(f"[bold]{result.total}[/bold] tables present.")
 
 
+@app.command("ingest")
+def ingest_cmd(
+    dataset: str = typer.Argument("adult", help="Dataset to ingest: adult"),
+) -> None:
+    """Ingest a dataset into features.* and capture its data versions."""
+    if dataset != "adult":
+        raise typer.BadParameter(f"unknown dataset {dataset!r} (only 'adult' so far)")
+
+    from .ingest import ingest_adult
+
+    result = ingest_adult()
+
+    console.print(f"[green]ingested[/green] {result.rows_written} rows  batch={result.ingest_batch_id}")
+    console.print(f"  splits: {result.split_counts}")
+
+    for label, snap in (("train", result.train_snapshot), ("eval", result.eval_snapshot)):
+        console.print(f"\n[bold]{label} data version[/bold]")
+        console.print(f"  data_snapshot_uuid  {snap.data_snapshot_uuid}")
+        console.print(f"  iceberg_snapshot_id {snap.iceberg_snapshot_id}")
+        console.print(f"  rows                {snap.row_count}")
+        console.print(f"  content_digest      {snap.content_digest[:32]}...")
+        console.print(f"  as_of range         {snap.min_as_of_ts} .. {snap.max_as_of_ts}")
+
+
 @app.command("tables")
 def tables_cmd() -> None:
     """List tables currently in the catalog with their row counts."""
