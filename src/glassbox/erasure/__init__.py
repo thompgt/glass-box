@@ -14,6 +14,16 @@ Two halves that answer different questions:
 
 from __future__ import annotations
 
+from .execute import (
+    COMPLETED,
+    FAILED,
+    IN_PROGRESS,
+    ErasureError,
+    ErasureResult,
+    erase_subject,
+    erasure_requests_for,
+    get_erasure_request,
+)
 from .report import (
     Contamination,
     ContaminationReport,
@@ -24,10 +34,18 @@ from .report import (
 )
 
 __all__ = [
+    "COMPLETED",
+    "FAILED",
+    "IN_PROGRESS",
     "Contamination",
     "ContaminationReport",
+    "ErasureError",
+    "ErasureResult",
     "contamination_report",
     "decisions_about",
+    "erase_subject",
+    "erasure_requests_for",
+    "get_erasure_request",
     "live_rows_for",
     "membership_of",
 ]
