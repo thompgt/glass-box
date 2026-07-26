@@ -35,6 +35,7 @@ Replay is idempotent in both directions:
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import os
 import threading
@@ -59,6 +60,17 @@ CLAIMED_SUFFIX = ".flushing"
 # parse as a date.
 _PREDICTION_TS_FIELDS = ("prediction_ts",)
 _ATTRIBUTION_TS_FIELDS = ("prediction_ts",)
+
+# Breaks ties between segments opened within the same clock tick. The wall clock
+# alone is not enough: ``datetime.now()`` resolves to roughly a millisecond on
+# Windows, and a server under load rotates segments faster than that, so two
+# segments routinely carry an identical timestamp. Sorting them by the random
+# uuid suffix would then commit them out of order.
+_sequence = itertools.count()
+
+
+def _stamp() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%f")
 
 
 @dataclass
@@ -138,8 +150,14 @@ class Spool:
             # Timestamp-prefixed so that a plain sort of the directory is
             # chronological: the audit trail's commit order should match the
             # order decisions were served, and a bare uuid4 would randomize it.
-            stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%f")
-            self._segment = self.directory / f"{stamp}-{uuid.uuid4().hex[:8]}{PENDING_SUFFIX}"
+            # The sequence number orders segments the clock cannot separate; the
+            # uuid only keeps two processes sharing a root from colliding, and is
+            # last precisely because it carries no order.
+            stamp = _stamp()
+            seq = next(_sequence)
+            self._segment = (
+                self.directory / f"{stamp}-{seq:08d}-{uuid.uuid4().hex[:8]}{PENDING_SUFFIX}"
+            )
         return self._segment
 
     def pending(self) -> list[Path]:

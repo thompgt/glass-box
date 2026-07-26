@@ -136,8 +136,16 @@ def test_segments_drain_in_the_order_decisions_were_served(gb_root, catalog, mon
     would test PyIceberg's file layout rather than the spool. What the spool owes
     is that it *commits* oldest-segment-first, which is what the audit trail's
     snapshot history then records.
+
+    The clock is frozen because that is the case the naming scheme has to survive:
+    ``datetime.now()`` resolves to about a millisecond on Windows, so a server
+    rotating segments under load gives several of them the same timestamp. Left to
+    a real clock this test passes or fails on whether a tick happened to land
+    between two appends.
     """
     import glassbox.serve.spool as spool_module
+
+    monkeypatch.setattr(spool_module, "_stamp", lambda: "20260314T150926000000")
 
     committed: list[str] = []
     real = spool_module.append_records
