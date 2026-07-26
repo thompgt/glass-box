@@ -25,6 +25,33 @@ from . import adult
 __all__ = ["adult", "ingest_adult", "IngestResult"]
 
 
+def _only_new_subjects(catalog, table: pa.Table) -> pa.Table:
+    """Drop rows whose ``subject_id`` is already in the feature table.
+
+    Ingest is append-only, and PyIceberg does not enforce Iceberg's identifier
+    fields on write — so without this, re-running ingest would happily land a
+    second row for every existing subject. That is not a cosmetic duplicate: it
+    would break ``subject_id`` as an identity, which is what erasure
+    contamination and training-set membership are both keyed on.
+
+    Deliberately *not* an upsert. A subject whose features changed is a new fact
+    about the world and should arrive as a new row with a later ``as_of_ts``,
+    not silently overwrite the row some model was trained on.
+    """
+    existing_table = catalog.load_table(CREDIT_APPLICATIONS.identifier)
+    if existing_table.current_snapshot() is None:
+        return table
+
+    known = set(
+        existing_table.scan(selected_fields=("subject_id",)).to_arrow()["subject_id"].to_pylist()
+    )
+    if not known:
+        return table
+
+    mask = pa.array([sid not in known for sid in table["subject_id"].to_pylist()], type=pa.bool_())
+    return table.filter(mask)
+
+
 @dataclass
 class IngestResult:
     dataset: str
@@ -49,6 +76,7 @@ def ingest_adult(root: Path | None = None) -> IngestResult:
     batch_id = str(uuid.uuid4())
     path = adult.download_adult(root)
     table = adult.parse_adult(path, ingest_batch_id=batch_id)
+    table = _only_new_subjects(catalog, table)
 
     written = append_arrow(catalog, CREDIT_APPLICATIONS, table)
 
