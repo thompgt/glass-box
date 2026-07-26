@@ -30,8 +30,8 @@ attribute.
 
 | # | Capability | Status |
 |---|---|---|
-| 1 | **Bit-exact reproducibility** — retrain from a recorded data version, assert an identical model artifact | planned |
-| 2 | **Right-to-explanation endpoint** — prediction ID → decision, signed attributions, model version, hyperparams, training-snapshot row count and date range | planned |
+| 1 | **Bit-exact reproducibility** — retrain from a recorded data version, assert an identical model artifact | **working** |
+| 2 | **Right-to-explanation endpoint** — prediction ID → decision, signed attributions, model version, hyperparams, training-snapshot row count and date range | **working** |
 | 3 | **Fairness regression detection** across model versions, attributing any regression to the model change or the data change | planned |
 | 4 | **Erasure contamination report** — subject → every model whose training snapshot contained them | planned |
 
@@ -39,8 +39,12 @@ attribute.
 
 ## Status
 
-**Phase 0 complete** — PyIceberg write-side behaviour measured, 13/13 probes.
-Phase 1 (walking skeleton) in progress. Nothing works end to end yet.
+**Capabilities 1 and 2 work end to end**, on the baseline logistic-regression
+recipe. `glassbox init → ingest → train → predict → explain` runs locally, and
+`glassbox reproduce <model-version>` retrains from the recorded data version and
+compares digests.
+
+Phase 0's PyIceberg measurements still hold — 13/13 probes.
 
 Run the probes yourself: `python scripts/phase0_spike.py` regenerates
 [`docs/pyiceberg-notes.md`](docs/pyiceberg-notes.md).
@@ -77,10 +81,56 @@ pip install -e ".[dev,fairness]"   # Phase 5 onward — fairlearn
 ## Usage
 
 ```bash
-glassbox init          # bootstrap catalog, namespaces, and all audit tables
+glassbox init                      # catalog, namespaces, and all 11 audit tables
+glassbox ingest adult              # load the dataset, capture its data versions
+glassbox train                     # fit, register, materialize training membership
+glassbox predict <model-version> \
+  --features '{"age": 39, "workclass": "Private", ...}'
+glassbox explain <prediction-id>   # why that decision was made
 ```
 
-More commands land as phases complete.
+`glassbox serve <model-version>` exposes the same two operations over HTTP:
+
+```
+POST /predictions                  -> {"prediction_id": ..., "decision": ...}
+GET  /explanations/{prediction_id} -> the full audit answer
+```
+
+The explanation is assembled from `audit.*` alone — the read path has no access
+to the model. That is the point: an attribution recomputed from a reloaded model
+is a statement about the model as it is now, while the question being asked is
+about the decision as it was made.
+
+Other commands: `glassbox reproduce <model-version>` (retrain and compare
+digests), `glassbox flush` (drain spooled predictions into the audit tables),
+`glassbox tables` (row counts).
+
+### What an explanation contains
+
+```
+DENY  score 0.3616  threshold 0.5
+  model_version_id   bef1a742-...  (baseline-logreg)
+  artifact_digest    0552e17ba0061e65...
+  hyperparams        {'C': 1.0, 'max_iter': 1000, 'solver': 'lbfgs', 'tol': 1e-06}
+  trained on         216 rows, 2024-01-10 .. 2025-12-26
+
+  # | about you              |    shap | pushed
+  1 | occupation = Tech-supp | -0.2755 | toward denial
+  2 | sex = Male             | +0.2026 | toward approval
+  3 | sex is not Female      | +0.2026 | toward approval
+  ...
+base -0.6725 + shown + residual +0.2425 = score in logit space   reconciles
+```
+
+Two details that are load-bearing rather than cosmetic:
+
+- **The residual.** The list is truncated, so the tail is carried explicitly and
+  the total still sums to the score. A top-5 view of a 33-column encoded matrix
+  that silently fails to add up is not an explanation.
+- **"sex is not Female".** One-hot columns for categories the subject is *not*
+  in still carry attribution — a zero differs from the training population's
+  average, and that difference moves the score. Dropping them would break
+  additivity; labelling them `sex_Female = Male` would assert something false.
 
 ---
 
