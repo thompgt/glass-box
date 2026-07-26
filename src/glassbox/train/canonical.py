@@ -81,7 +81,9 @@ def _tree_payload(estimator) -> dict:
             "dump": bytes(booster.save_raw("ubj")).hex(),
         }
 
-    raise UnsupportedModelError(f"no canonical dump defined for {module}.{type(estimator).__name__}")
+    raise UnsupportedModelError(
+        f"no canonical dump defined for {module}.{type(estimator).__name__}"
+    )
 
 
 def feature_names_of(model) -> list[str]:

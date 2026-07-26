@@ -19,7 +19,6 @@ from glassbox.writer import arrow_schema_for
 
 from .conftest import DUPLICATE_ROW
 
-
 # --------------------------------------------------------------- digests ----
 
 def test_canonical_json_is_key_order_independent():

@@ -134,7 +134,7 @@ def capture_snapshot(
         data_snapshot_uuid=snapshot_uuid(td.name, current.snapshot_id, filter_expr),
         table_identifier=td.name,
         iceberg_snapshot_id=current.snapshot_id,
-        captured_at=dt.datetime.now(dt.timezone.utc),
+        captured_at=dt.datetime.now(dt.UTC),
         row_count=arrow.num_rows,
         content_digest=digest,
         filter_expr=filter_expr,

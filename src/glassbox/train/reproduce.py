@@ -161,7 +161,8 @@ def _content_digest_of(catalog, snap: dict) -> str:
     from ..digest import digest_arrow_table
     from ..snapshots import DIGEST_EXCLUDE
 
-    td = CREDIT_APPLICATIONS if snap["table_identifier"] == CREDIT_APPLICATIONS.name else EVAL_HOLDOUT
+    is_training_table = snap["table_identifier"] == CREDIT_APPLICATIONS.name
+    td = CREDIT_APPLICATIONS if is_training_table else EVAL_HOLDOUT
     table = materialize(catalog, snap, td)
     digest, _ = digest_arrow_table(table, exclude=DIGEST_EXCLUDE)
     return digest

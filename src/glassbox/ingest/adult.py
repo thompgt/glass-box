@@ -66,7 +66,7 @@ INT_COLUMNS = frozenset(
 )
 
 # as_of_ts is spread deterministically across this window.
-EPOCH = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+EPOCH = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 WINDOW_DAYS = 730
 
 

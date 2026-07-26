@@ -60,7 +60,7 @@ class ModelVersion:
     metrics: dict[str, float] = field(default_factory=dict)
     registered_name: str = "glassbox-credit"
     status: str = "active"
-    trained_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+    trained_at: dt.datetime = field(default_factory=lambda: dt.datetime.now(dt.UTC))
 
     def to_record(self) -> dict[str, Any]:
         return {

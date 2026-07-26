@@ -51,7 +51,9 @@ def ingest_cmd(
 
     result = ingest_adult()
 
-    console.print(f"[green]ingested[/green] {result.rows_written} rows  batch={result.ingest_batch_id}")
+    console.print(
+        f"[green]ingested[/green] {result.rows_written} rows  batch={result.ingest_batch_id}"
+    )
     console.print(f"  splits: {result.split_counts}")
 
     for label, snap in (("train", result.train_snapshot), ("eval", result.eval_snapshot)):
