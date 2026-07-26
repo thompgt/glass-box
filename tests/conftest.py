@@ -91,3 +91,20 @@ def adult_file(gb_root: Path) -> Path:
 def catalog(gb_root: Path):
     bootstrap(gb_root)
     return load_catalog(gb_root)
+
+
+@pytest.fixture(scope="session")
+def adult_table(tmp_path_factory: pytest.TempPathFactory):
+    """The synthetic rows parsed to Arrow, with no catalog, MLflow, or warehouse.
+
+    Session-scoped and deliberately provenance-free. Tests of the modelling and
+    explanation *math* do not need a round trip through Iceberg and MLflow to be
+    meaningful, and paying ~30s of training and artifact logging for each one
+    buys no additional coverage — the round trip is exercised by the integration
+    tests that are actually about it.
+    """
+    from glassbox.ingest import adult
+
+    path = tmp_path_factory.mktemp("adult") / "adult.data"
+    path.write_text("\n".join(_synthetic_adult_lines()) + "\n", encoding="utf-8")
+    return adult.parse_adult(path, ingest_batch_id="fixture")

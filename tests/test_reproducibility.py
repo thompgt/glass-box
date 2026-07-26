@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from glassbox.ingest import ingest_adult
-from glassbox.schemas import CREDIT_APPLICATIONS, MODEL_VERSIONS, TRAINING_MEMBERSHIP
+from glassbox.schemas import CREDIT_APPLICATIONS, TRAINING_MEMBERSHIP
 from glassbox.train import features as F
 from glassbox.train import train_baseline
 from glassbox.train.canonical import UnsupportedModelError, model_digest
@@ -101,7 +101,8 @@ def test_a_data_change_changes_the_digest(trained, catalog, gb_root, adult_file)
 
 
 def test_hyperparameter_change_changes_the_digest(trained, gb_root):
-    other = train_baseline(root=gb_root, hyperparams={"C": 0.01, "max_iter": 1000, "solver": "lbfgs"})
+    hyperparams = {"C": 0.01, "max_iter": 1000, "solver": "lbfgs"}
+    other = train_baseline(root=gb_root, hyperparams=hyperparams)
     assert other.model_version.artifact_digest != trained.model_version.artifact_digest
 
 
