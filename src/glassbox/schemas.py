@@ -284,6 +284,19 @@ FAIRNESS_EVALUATIONS = TableDef(
         NestedField(7, "metric_value", DoubleType(), required=True),
         NestedField(8, "n", LongType(), required=True),
         NestedField(9, "evaluated_at", TimestamptzType(), required=True),
+        # Both of these are part of the *definition* of the metric rather than
+        # context for it, so both are recorded and both are part of the row's
+        # identity. A selection rate is "the fraction scored at or above *what*",
+        # and a demographic-parity difference is "the spread across groups of at
+        # least *what size*". Without them the recorded value cannot be checked,
+        # only believed — and two analyses using different cutoffs would collide
+        # as though one of them were wrong.
+        NestedField(10, "decision_threshold", DoubleType(), required=True),
+        # Null on per-group rows, where it does not apply: a group's own rate is
+        # computed whatever its size, and the row carries the ``n`` that says how
+        # much to trust it. Set only on the across-group difference rows, which
+        # are the ones the cutoff governs.
+        NestedField(11, "min_group_n", IntegerType(), required=False),
     ),
     partition_spec=PartitionSpec(
         PartitionField(
@@ -313,6 +326,8 @@ FAIRNESS_DECOMPOSITIONS = TableDef(
         # comparison that was made and later invalidated is itself audit history.
         NestedField(13, "comparable", BooleanType(), required=True),
         NestedField(14, "computed_at", TimestamptzType(), required=True),
+        NestedField(15, "decision_threshold", DoubleType(), required=True),
+        NestedField(16, "min_group_n", IntegerType(), required=True),
         identifier_field_ids=[1],
     ),
     properties=DEFAULT_PROPERTIES,

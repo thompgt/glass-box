@@ -15,6 +15,13 @@ fixed. The decomposition is exact: the two effects sum to the observed change.
 
 from __future__ import annotations
 
+from .evaluate import (
+    FairnessEvaluation,
+    FairnessEvaluationConflict,
+    SensitiveAttributeError,
+    evaluate_fairness,
+    get_evaluation,
+)
 from .metrics import (
     DIFFERENCE_METRICS,
     GROUP_METRICS,
@@ -28,7 +35,12 @@ __all__ = [
     "DIFFERENCE_METRICS",
     "GROUP_METRICS",
     "MIN_GROUP_N",
+    "FairnessEvaluation",
+    "FairnessEvaluationConflict",
     "GroupResult",
+    "SensitiveAttributeError",
     "differences",
+    "evaluate_fairness",
+    "get_evaluation",
     "group_metrics",
 ]
