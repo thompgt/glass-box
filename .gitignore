@@ -1,0 +1,33 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Glass Box local state — all of this is regenerable from `glassbox init`
+warehouse/
+catalog.db
+catalog.db-*
+spool.db
+spool.db-*
+mlruns/
+mlflow.db
+scratch/
+
+# Data (downloaded by `glassbox ingest`, never committed)
+data/raw/
+data/*.csv
+data/*.parquet
+
+# Benchmarks / demo output
+bench/results/*.json
+demo/out/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
