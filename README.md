@@ -32,17 +32,19 @@ attribute.
 |---|---|---|
 | 1 | **Bit-exact reproducibility** — retrain from a recorded data version, assert an identical model artifact | **working** |
 | 2 | **Right-to-explanation endpoint** — prediction ID → decision, signed attributions, model version, hyperparams, training-snapshot row count and date range | **working** |
-| 3 | **Fairness regression detection** across model versions, attributing any regression to the model change or the data change | planned |
-| 4 | **Erasure contamination report** — subject → every model whose training snapshot contained them | planned |
+| 3 | **Fairness regression detection** across model versions, attributing any regression to the model change or the data change | **working** |
+| 4 | **Erasure contamination report** — subject → every model whose training snapshot contained them | **working** |
 
 ---
 
 ## Status
 
-**Capabilities 1 and 2 work end to end**, on the baseline logistic-regression
-recipe. `glassbox init → ingest → train → predict → explain` runs locally, and
+**All four capabilities work end to end**, on the baseline logistic-regression
+recipe. `glassbox init → ingest → train → predict → explain` runs locally,
 `glassbox reproduce <model-version>` retrains from the recorded data version and
-compares digests.
+compares digests, `glassbox compare A B` attributes a fairness change to its
+cause, and `glassbox erase <subject>` removes a subject while keeping the record
+that they were once there.
 
 Phase 0's PyIceberg measurements still hold — 13/13 probes.
 
@@ -56,7 +58,7 @@ Four findings that shaped the code:
 | PyIceberg's default `PyArrowFileIO` **cannot address local files on Windows** — the `C:` drive letter is parsed as a URI scheme | `FsspecFileIO` is pinned explicitly in `catalog.py` |
 | `expire_snapshots` removes **metadata only**; orphaned Parquet files stay on disk | GDPR erasure cannot rely on it alone and must unlink data files itself |
 | A single-row delete rewrote **1 of 4** data files on a `bucket(4)` table | Confirms bucketing `features.*` on `subject_id` bounds erasure cost |
-| `timestamp[ns]` (pandas' default) and `large_string` (Polars' default) are both **rejected** on write | Every write derives its Arrow schema from the Iceberg schema (`writer.py`) rather than hand-rolling one |
+| `timestamp[ns]` (pandas' default) and `large_string` (Polars' default) are both **rejected** on write | Every write derives its Arrow schema from the **live table's** Iceberg schema (`writer.py`) rather than hand-rolling one — or trusting the declaration, whose nested field IDs `create_table` renumbers |
 
 ---
 
@@ -75,7 +77,6 @@ Optional extras are installed per phase to keep early resolution fast:
 ```bash
 pip install -e ".[dev,explain]"    # Phase 3 onward — SHAP
 pip install -e ".[dev,automl]"     # Phase 4 onward — FLAML, LightGBM, XGBoost
-pip install -e ".[dev,fairness]"   # Phase 5 onward — fairlearn
 ```
 
 ## Usage
@@ -100,6 +101,15 @@ The explanation is assembled from `audit.*` alone — the read path has no acces
 to the model. That is the point: an attribution recomputed from a reloaded model
 is a statement about the model as it is now, while the question being asked is
 about the decision as it was made.
+
+Fairness and erasure:
+
+```bash
+glassbox fairness <model-version> --attribute sex   # group metrics on the frozen eval set
+glassbox compare <baseline> <candidate>             # attribute a change to model or data
+glassbox contamination <subject-id>                 # which models trained on this person
+glassbox erase <subject-id>                         # remove them; irreversibly
+```
 
 Other commands: `glassbox reproduce <model-version>` (retrain and compare
 digests), `glassbox flush` (drain spooled predictions into the audit tables),
@@ -131,6 +141,68 @@ Two details that are load-bearing rather than cosmetic:
   in still carry attribution — a zero differs from the training population's
   average, and that difference moves the score. Dropping them would break
   additivity; labelling them `sex_Female = Male` would assert something false.
+
+### What a fairness comparison says
+
+```
+baseline  A  8ee8d824-...      candidate B  e59a9a8e-...
+  A' (A's config, B's data)  e59a9a8e-...
+  B' (B's config, A's data)  8ee8d824-...
+  0 counterfactual(s) trained
+
+  metric              A        B      total     model     data    blame
+  demographic_parity  0.0309   0.3505  +0.3196   +0.0000  +0.3196   data
+  equal_opportunity   0.0500   0.3250  +0.2750   +0.0000  +0.2750   data
+  equalized_odds      0.0500   0.3684  +0.3184   +0.0000  +0.3184   data
+  accuracy            0.2372   0.3300  +0.0928   +0.0000  +0.0928   data
+```
+
+Retraining the same recipe on a batch of new rows where `sex` determines the
+label: demographic parity widens elevenfold, and the decomposition puts every
+bit of it on the data and none on the model, which is the right answer and a
+checkable one. `model + data = total` holds exactly — asserted on every
+decomposition, not assumed.
+
+Getting there requires training the two counterfactuals that hold one factor
+fixed: `A'` is the baseline's configuration on the candidate's data, `B'` the
+reverse. The effects are the average of both ways round the square, because along
+a single path any interaction between the two changes is attributed entirely to
+whichever was applied second, and there is no principled reason to prefer an
+order. The symmetric average is the two-player Shapley value.
+
+Both counterfactuals are registered model versions with `status='counterfactual'`,
+so the decomposition cites four model IDs and anyone can reload each and re-check
+the arithmetic. They are reused when they already exist — sound only because
+capability 1 holds, since bit-exact training means a matching row *is* the
+counterfactual rather than merely resembling it. In the run above only the data
+changed, so `A'` is `B`, `B'` is `A`, and nothing was trained.
+
+### What erasure destroys, and what it must not
+
+`expire_snapshots` is metadata-only — Phase 0 measured `files_removed=False` — and
+a PyIceberg delete is copy-on-write, so the rows leave the current snapshot while
+every byte stays on disk and one time-travel scan away. Erasure therefore deletes
+the live rows, expires every snapshot that still contains them, **and unlinks the
+Parquet files no surviving snapshot references.** The test for this opens every
+file in the feature warehouse and looks; without the unlink step it fails while
+every table-level assertion still passes.
+
+What survives is `audit.training_membership`. That is not a leak, it is the
+capability: "which models saw me?" has to stay answerable *after* the data is
+gone, which is precisely when it is asked. The affected models stay fully
+attributable — recipe, hyperparameters, digests, the tombstone recording what
+their training data contained — and become permanently unreproducible. Provenance
+outlives erasure; reproducibility does not, and the system says which.
+
+Two boundaries worth stating plainly:
+
+- **Contaminated models are not retired automatically.** Whether a model trained
+  on erased data must leave service is a legal judgement that differs by
+  jurisdiction. It is reported; `--retire` applies it when someone has decided.
+- **Decision records are not deleted.** `audit.predictions` holds decisions served
+  about the subject, including their inputs. Erasing those would destroy the
+  evidence a subject needs to contest a decision made about them, so the report
+  lists them and leaves the call to an operator.
 
 ---
 
