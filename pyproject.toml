@@ -15,6 +15,10 @@ dependencies = [
     # Provenance / storage
     "pyiceberg[sql-sqlite,pyarrow]>=0.9",
     "pyarrow>=17",
+    # Direct dependency, not transitive: PyIceberg's default PyArrowFileIO cannot
+    # address local files on Windows (the drive letter parses as a URI scheme), so
+    # glassbox.catalog pins FsspecFileIO. See docs/pyiceberg-notes.md.
+    "fsspec>=2024.6",
     "duckdb>=1.1",
     # Tracking
     "mlflow>=2.16",

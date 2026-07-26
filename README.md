@@ -39,10 +39,20 @@ attribute.
 
 ## Status
 
-Phase 0 (Iceberg literacy spike). Nothing works end to end yet.
+**Phase 0 complete** — PyIceberg write-side behaviour measured, 13/13 probes.
+Phase 1 (walking skeleton) in progress. Nothing works end to end yet.
 
-See [`docs/`](docs/) for design notes and [`docs/pyiceberg-notes.md`](docs/pyiceberg-notes.md)
-for measured PyIceberg write-side behaviour on the pinned version.
+Run the probes yourself: `python scripts/phase0_spike.py` regenerates
+[`docs/pyiceberg-notes.md`](docs/pyiceberg-notes.md).
+
+Four findings that shaped the code:
+
+| Finding | Consequence |
+|---|---|
+| PyIceberg's default `PyArrowFileIO` **cannot address local files on Windows** — the `C:` drive letter is parsed as a URI scheme | `FsspecFileIO` is pinned explicitly in `catalog.py` |
+| `expire_snapshots` removes **metadata only**; orphaned Parquet files stay on disk | GDPR erasure cannot rely on it alone and must unlink data files itself |
+| A single-row delete rewrote **1 of 4** data files on a `bucket(4)` table | Confirms bucketing `features.*` on `subject_id` bounds erasure cost |
+| `timestamp[ns]` (pandas' default) and `large_string` (Polars' default) are both **rejected** on write | Every write derives its Arrow schema from the Iceberg schema (`writer.py`) rather than hand-rolling one |
 
 ---
 

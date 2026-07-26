@@ -44,6 +44,18 @@ class Probe:
 PROBES: list[Probe] = []
 
 
+def table_data_dir(warehouse: Path, table_name: str) -> Path:
+    """Locate a table's data directory without assuming the namespace layout.
+
+    PyIceberg has used both ``<ns>.db/<table>`` and ``<ns>/<table>`` over its
+    releases, so the layout is discovered rather than hard-coded.
+    """
+    for candidate in warehouse.rglob(f"{table_name}/data"):
+        if candidate.is_dir():
+            return candidate
+    return warehouse / table_name / "data"
+
+
 def probe(name: str, question: str):
     """Decorator: run the function, capture pass/fail plus any exception."""
 
@@ -82,9 +94,15 @@ def main() -> int:
     warehouse = tmp / "warehouse"
     warehouse.mkdir(parents=True)
 
+    from glassbox.catalog import FILE_IO_IMPL
+
     catalog = SqlCatalog(
         "spike",
-        **{"uri": f"sqlite:///{(tmp / 'catalog.db').as_posix()}", "warehouse": warehouse.as_uri()},
+        **{
+            "uri": f"sqlite:///{(tmp / 'catalog.db').as_posix()}",
+            "warehouse": warehouse.as_uri(),
+            "py-io-impl": FILE_IO_IMPL,
+        },
     )
     catalog.create_namespace("spike")
 
@@ -124,12 +142,53 @@ def main() -> int:
 
     # ---------------------------------------------------------------- probes --
 
+    @probe("local-fileio-windows", "Can the default PyArrowFileIO address local files here?")
+    def _(p: Probe):
+        """Records *why* FILE_IO_IMPL is pinned, so the choice is not cargo cult."""
+        import platform
+
+        probe_tmp = tmp / "iocheck"
+        probe_tmp.mkdir(exist_ok=True)
+        results = {}
+        for label, io_impl in (
+            ("PyArrowFileIO", "pyiceberg.io.pyarrow.PyArrowFileIO"),
+            ("FsspecFileIO", "pyiceberg.io.fsspec.FsspecFileIO"),
+        ):
+            wh = probe_tmp / label
+            wh.mkdir(exist_ok=True)
+            try:
+                c = SqlCatalog(
+                    label,
+                    **{
+                        "uri": f"sqlite:///{(probe_tmp / f'{label}.db').as_posix()}",
+                        "warehouse": wh.as_uri(),
+                        "py-io-impl": io_impl,
+                    },
+                )
+                c.create_namespace("io")
+                t = c.create_table(("io", "probe"), schema)
+                t.append(rows(2))
+                results[label] = f"OK ({t.scan().to_arrow().num_rows} rows)"
+            except Exception as exc:  # noqa: BLE001
+                results[label] = f"FAIL {type(exc).__name__}"
+
+        p.notes.append(f"platform: {platform.system()} {platform.release()}")
+        for label, outcome in results.items():
+            p.notes.append(f"`{label}`: {outcome}")
+        if results.get("PyArrowFileIO", "").startswith("FAIL"):
+            p.notes.append(
+                "The Windows drive letter in an absolute path is parsed as a URI "
+                "scheme, so every local path form fails. FsspecFileIO is therefore "
+                "pinned in glassbox.catalog rather than left to inference."
+            )
+        return " | ".join(f"{k}={v}" for k, v in results.items())
+
     @probe("bucket-partitioned-write", "Can PyIceberg append to a bucket()-partitioned table?")
     def _(p: Probe):
         t = catalog.create_table(("spike", "bucketed"), schema, partition_spec=bucket_spec)
         t.append(rows(40))
         n = t.scan().to_arrow().num_rows
-        files = list((warehouse / "spike.db" / "bucketed" / "data").rglob("*.parquet"))
+        files = list((table_data_dir(warehouse, "bucketed")).rglob("*.parquet"))
         p.notes.append(f"{len(files)} data files written across buckets")
         assert n == 40, n
         return f"40 rows, {len(files)} files"
@@ -139,7 +198,7 @@ def main() -> int:
         t = catalog.create_table(("spike", "daily"), schema, partition_spec=day_spec)
         t.append(rows(30))
         n = t.scan().to_arrow().num_rows
-        files = list((warehouse / "spike.db" / "daily" / "data").rglob("*.parquet"))
+        files = list((table_data_dir(warehouse, "daily")).rglob("*.parquet"))
         p.notes.append(f"{len(files)} data files (expect 3 — three distinct days)")
         assert n == 30, n
         return f"30 rows, {len(files)} files"
@@ -216,20 +275,20 @@ def main() -> int:
     @probe("expire-snapshots", "Is expire_snapshots available, and does it remove data files?")
     def _(p: Probe):
         t = catalog.load_table(("spike", "history"))
-        data_dir = warehouse / "spike.db" / "history" / "data"
+        data_dir = table_data_dir(warehouse, "history")
         files_before = len(list(data_dir.rglob("*.parquet")))
         snaps_before = len(list(t.snapshots()))
 
-        if not hasattr(t, "expire_snapshots"):
-            p.notes.append("t.expire_snapshots MISSING on this version.")
-            raise AttributeError("Table.expire_snapshots not available")
+        # 0.11.x exposes this as table.maintenance.expire_snapshots(), not as a
+        # method on Table itself. Probed rather than assumed.
+        if not hasattr(t, "maintenance"):
+            p.notes.append("Table.maintenance MISSING on this version.")
+            raise AttributeError("Table.maintenance not available")
 
         newest = max(t.snapshots(), key=lambda s: s.timestamp_ms)
-        others = [s for s in t.snapshots() if s.snapshot_id != newest.snapshot_id]
-        expirer = t.expire_snapshots()
-        for s in others:
-            expirer = expirer.expire_snapshot_id(s.snapshot_id)
-        expirer.commit()
+        others = [s.snapshot_id for s in t.snapshots() if s.snapshot_id != newest.snapshot_id]
+        p.notes.append("API surface: `table.maintenance.expire_snapshots().by_ids([...]).commit()`")
+        t.maintenance.expire_snapshots().by_ids(others).commit()
 
         t = catalog.load_table(("spike", "history"))
         snaps_after = len(list(t.snapshots()))
