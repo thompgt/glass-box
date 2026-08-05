@@ -11,6 +11,15 @@ layer load-bearing rather than decorative.
 Runs entirely locally: SQLite Iceberg catalog, local-filesystem warehouse, local
 MLflow. No cloud dependencies.
 
+## Tech Stack
+
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white)
+![SHAP](https://img.shields.io/badge/SHAP-1F77B4?style=for-the-badge)
+![Explainable AI](https://img.shields.io/badge/Explainable%20AI-5B2C8D?style=for-the-badge)
+![Fairness Audit](https://img.shields.io/badge/Fairness%20Audit-0B7261?style=for-the-badge)
+![Model Provenance](https://img.shields.io/badge/Model%20Provenance-8A5A2B?style=for-the-badge)
+
 ---
 
 ## The invariant
