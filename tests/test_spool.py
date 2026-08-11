@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import threading
 
 import pytest
 
@@ -223,6 +224,55 @@ def test_a_torn_final_line_does_not_strand_the_decisions_ahead_of_it(spool, cata
 
     assert result.predictions_written == 2
     assert {r["prediction_id"] for r in rows(catalog, PREDICTIONS)} == {"p1", "p2"}
+
+
+def test_a_segment_being_drained_is_invisible_to_a_second_flush(spool, catalog, monkeypatch):
+    """Concurrent flushes must not both drain the same in-flight segment.
+
+    Three callers flush this spool in a live process — the 5s background tick,
+    a read-miss lookup, and the shutdown hook — and they can overlap. A claimed
+    segment used to stay visible to :meth:`pending`, and ``_drain_segment``
+    treated *any* claimed segment as recovered from a previous process: it would
+    skip the atomic claim, delete the attributions the first flush had just
+    written as though they were crash orphans, and append the whole envelope a
+    second time. Duplicate rows in an audit table are the one outcome this module
+    exists to make impossible.
+
+    The first flush is held open inside its attributions commit so the race is
+    deterministic rather than timing-dependent.
+    """
+    import glassbox.serve.spool as spool_module
+
+    real = spool_module.append_records
+    inside = threading.Event()
+    seen_by_second: list[list] = []
+    release = threading.Event()
+
+    def blocking(catalog, td, records):
+        if td.name == ATTRIBUTIONS.name:
+            inside.set()
+            release.wait(30)
+        return real(catalog, td, records)
+
+    monkeypatch.setattr(spool_module, "append_records", blocking)
+    spool.append(envelope("p1"))
+
+    first = threading.Thread(target=spool.flush, args=(catalog,))
+    first.start()
+    assert inside.wait(30), "the first flush never reached its commit"
+
+    # Mid-drain: the segment is claimed and must not be offered to anyone else.
+    seen_by_second.append(spool.pending())
+
+    second = threading.Thread(target=spool.flush, args=(catalog,))
+    second.start()
+    release.set()
+    first.join(30)
+    second.join(30)
+
+    assert seen_by_second[0] == [], "an in-flight segment was offered to a second flush"
+    assert len(rows(catalog, PREDICTIONS)) == 1
+    assert len(rows(catalog, ATTRIBUTIONS)) == 3, "attributions were double-written"
 
 
 # --------------------------------------------------------------- batching ----

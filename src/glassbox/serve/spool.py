@@ -114,10 +114,30 @@ class Spool:
     # writes would tear both lines, and a rotation racing an append would drop
     # one into a segment that is already being drained.
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Serializes whole flushes. The append lock is not enough: it is released the
+    # moment a segment is claimed, so two flushes could each claim a *different*
+    # segment and interleave their Iceberg commits — and, worse, a flush entering
+    # while another is mid-drain used to see the in-flight ``.flushing`` file and
+    # drain it a second time. One flush at a time per process.
+    _flush_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Segments a *previous* process claimed and never finished. Determined once,
+    # at construction, because that is the only moment at which a ``.flushing``
+    # file is unambiguously stale: after this object exists, every such file is
+    # either one of these or one this process is draining right now.
+    _recoverable: set[Path] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._recoverable = self._scan_recoverable()
 
     @property
     def directory(self) -> Path:
         return Path(self.root) / SPOOL_DIRNAME
+
+    def _scan_recoverable(self) -> set[Path]:
+        """Claimed-but-undrained segments left behind by a previous process."""
+        if not self.directory.exists():
+            return set()
+        return {p for p in self.directory.iterdir() if p.suffix == CLAIMED_SUFFIX}
 
     # ------------------------------------------------------------- writing ----
 
@@ -161,13 +181,19 @@ class Spool:
         return self._segment
 
     def pending(self) -> list[Path]:
+        """Segments awaiting a commit: unclaimed ones, plus crash leftovers.
+
+        A ``.flushing`` segment is included **only** when it was already on disk
+        when this Spool was constructed. Returning every ``.flushing`` file would
+        hand a caller a segment another flush is actively draining, and both
+        drainers would then miss each other's existence check and append the same
+        audit rows twice — the exact duplication this module exists to prevent.
+        """
         if not self.directory.exists():
             return []
-        return sorted(
-            p
-            for p in self.directory.iterdir()
-            if p.suffix in (PENDING_SUFFIX, CLAIMED_SUFFIX)
-        )
+        live = [p for p in self.directory.iterdir() if p.suffix == PENDING_SUFFIX]
+        stale = [p for p in self._recoverable if p.exists()]
+        return sorted(live + stale)
 
     def pending_count(self) -> int:
         """Decisions recorded on disk but not yet committed to Iceberg."""
@@ -185,15 +211,19 @@ class Spool:
         CLI command. Segments are drained oldest-first so the audit trail's
         commit order matches the order decisions were served.
         """
-        result = FlushResult()
-        for segment in self.pending():
-            self._drain_segment(catalog, segment, result)
-        return result
+        with self._flush_lock:
+            result = FlushResult()
+            for segment in self.pending():
+                self._drain_segment(catalog, segment, result)
+            return result
 
     def _drain_segment(self, catalog, segment: Path, result: FlushResult) -> None:
-        recovered = segment.suffix == CLAIMED_SUFFIX
-
         with self._lock:
+            # Claiming a recovered segment is removing it from the recovery set:
+            # its ``.flushing`` name is already the claim, and taking it out here
+            # means a second drainer cannot also treat it as recoverable.
+            recovered = segment in self._recoverable
+            self._recoverable.discard(segment)
             if segment == self._segment:
                 # Retire the live segment before renaming it, so an append racing
                 # this flush opens a new file rather than writing rows into a
