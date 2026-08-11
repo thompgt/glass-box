@@ -81,11 +81,14 @@ py -3.12 -m venv .venv
 pip install -e ".[dev]"
 ```
 
-Optional extras are installed per phase to keep early resolution fast:
+That is everything the commands below need — SHAP included. Attribution is not
+an extra: every served prediction computes its SHAP values before the response
+is built, so an install without it cannot run `glassbox predict`.
+
+One optional extra remains, for the alternative model families:
 
 ```bash
-pip install -e ".[dev,explain]"    # Phase 3 onward — SHAP
-pip install -e ".[dev,automl]"     # Phase 4 onward — FLAML, LightGBM, XGBoost
+pip install -e ".[dev,automl]"     # FLAML, LightGBM, XGBoost
 ```
 
 ## Usage
