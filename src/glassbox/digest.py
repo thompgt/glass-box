@@ -21,6 +21,8 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
+import warnings
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,21 @@ __all__ = [
     "content_digest",
     "digest_arrow_table",
     "env_digest",
+    "find_lockfile",
+    "UNLOCKED",
+    "UnlockedEnvironmentWarning",
 ]
+
+LOCKFILE_NAME = "requirements.lock"
+LOCKFILE_ENV = "GLASSBOX_LOCKFILE"
+
+# Recorded when no lockfile can be found. A sentinel rather than a failure so a
+# wheel install can still train — but see :func:`env_digest` for why it is loud.
+UNLOCKED = "unlocked"
+
+
+class UnlockedEnvironmentWarning(UserWarning):
+    """No lockfile was found, so environment drift cannot be detected."""
 
 
 def _default(obj: Any) -> Any:
@@ -112,15 +128,54 @@ def digest_arrow_table(
     return content_digest(digests), digests
 
 
+def find_lockfile() -> Path | None:
+    """Locate ``requirements.lock``, or ``None`` if this install has no lock.
+
+    Searched in order of how deliberate the answer is: an explicit environment
+    override, the repository root (an editable install or a checkout), then
+    alongside the package itself (a copy shipped with a wheel).
+    """
+    override = os.environ.get(LOCKFILE_ENV)
+    if override:
+        path = Path(override).expanduser()
+        return path if path.exists() else None
+
+    here = Path(__file__).resolve()
+    for candidate in (here.parents[2] / LOCKFILE_NAME, here.parent / LOCKFILE_NAME):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def env_digest(lock_path: Path | None = None) -> str:
     """Digest of the pinned environment.
 
     Reproduction refuses to run when this differs from what was recorded at
     training time: retraining under a different NumPy is a different experiment,
     and reporting a digest mismatch as "not reproducible" would be a lie.
+
+    The absent-lockfile case is the one worth being noisy about. Returning a
+    constant sentinel makes the guard *vacuous*: every model records
+    ``"unlocked"``, reproduction compares that to itself, and the check passes
+    unconditionally while dependency ranges are free to move underneath it. A
+    guard that always passes is worse than no guard, because it is reported as
+    having been checked. So the sentinel stays — a wheel with no lock must still
+    be able to train — but it announces itself, and
+    :func:`glassbox.train.reproduce.retrain_from_provenance` refuses to treat it
+    as agreement under ``strict_env``.
     """
     if lock_path is None:
-        lock_path = Path(__file__).resolve().parents[2] / "requirements.lock"
-    if not lock_path.exists():
-        return "unlocked"
+        lock_path = find_lockfile()
+    if lock_path is None or not lock_path.exists():
+        warnings.warn(
+            f"no {LOCKFILE_NAME} found: recording env_digest={UNLOCKED!r}. The "
+            f"environment-drift guard cannot detect anything in this state — every "
+            f"model version will agree with every other regardless of what is "
+            f"installed. Generate one with "
+            f"`python -m pip freeze --exclude-editable > {LOCKFILE_NAME}`, or point "
+            f"{LOCKFILE_ENV} at an existing lock.",
+            UnlockedEnvironmentWarning,
+            stacklevel=2,
+        )
+        return UNLOCKED
     return sha256_hex(lock_path.read_bytes())

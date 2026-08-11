@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 
 from ..catalog import glassbox_root, load_catalog
-from ..digest import canonical_json, env_digest
+from ..digest import LOCKFILE_NAME, UNLOCKED, canonical_json, env_digest
 from ..schemas import CREDIT_APPLICATIONS, EVAL_HOLDOUT
 from ..snapshots import get_snapshot, materialize
 from . import features as F
@@ -95,6 +95,19 @@ def retrain_from_provenance(
         raise ValueError(f"no audit.model_versions row for {model_version_id}")
 
     current_env = env_digest()
+    if strict_env and UNLOCKED in (current_env, record["env_digest"]):
+        # Equality here would be meaningless: "unlocked" == "unlocked" is not
+        # evidence that two environments agree, it is evidence that neither was
+        # ever pinned. Passing on it would report an unchecked guard as checked.
+        raise EnvironmentDriftError(
+            f"environment drift cannot be checked for {model_version_id}: recorded "
+            f"env_digest={record['env_digest']!r}, current={current_env!r}. "
+            f"{UNLOCKED!r} means no {LOCKFILE_NAME} was present, so a match proves "
+            f"nothing about the installed packages. Generate a lock with "
+            f"`python -m pip freeze --exclude-editable > {LOCKFILE_NAME}` and "
+            f"retrain, or pass strict_env=False to proceed and report the result "
+            f"as advisory."
+        )
     if strict_env and record["env_digest"] != current_env:
         raise EnvironmentDriftError(
             f"model {model_version_id} was trained under env_digest "

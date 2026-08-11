@@ -154,3 +154,39 @@ def test_code_git_sha_describes_the_code_not_the_data_root(gb_root: Path, monkey
 
     assert reported != UNKNOWN_GIT_SHA
     assert reported.startswith(expected)
+
+
+# ----------------------------------------------------------- environment ----
+
+def test_env_digest_is_the_hash_of_the_lockfile(tmp_path: Path):
+    from glassbox.digest import env_digest, sha256_hex
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_bytes(b"numpy==2.4.6\n")
+    assert env_digest(lock) == sha256_hex(b"numpy==2.4.6\n")
+
+    lock.write_bytes(b"numpy==2.4.7\n")
+    assert env_digest(lock) != sha256_hex(b"numpy==2.4.6\n")
+
+
+def test_the_repository_ships_a_lockfile():
+    """Without one the drift guard is vacuous.
+
+    ``env_digest`` degrades to a constant when no lock is found, so every model
+    version records the same value and reproduction compares it to itself — a
+    check that passes unconditionally while NumPy is free to move underneath it.
+    A guard reported as checked but incapable of failing is worse than no guard.
+    """
+    from glassbox.digest import UNLOCKED, env_digest, find_lockfile
+
+    lock = find_lockfile()
+    assert lock is not None and lock.exists(), "requirements.lock is not committed"
+    assert env_digest() != UNLOCKED
+
+
+def test_a_missing_lockfile_is_announced_not_swallowed(tmp_path: Path, monkeypatch):
+    from glassbox.digest import UNLOCKED, UnlockedEnvironmentWarning, env_digest
+
+    monkeypatch.setenv("GLASSBOX_LOCKFILE", str(tmp_path / "does-not-exist.lock"))
+    with pytest.warns(UnlockedEnvironmentWarning):
+        assert env_digest() == UNLOCKED
