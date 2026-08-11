@@ -40,6 +40,7 @@ import json
 import os
 import threading
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,9 @@ PENDING_SUFFIX = ".jsonl"
 # concurrent writer appending to the live segment cannot have its rows consumed
 # and then unlinked underneath it.
 CLAIMED_SUFFIX = ".flushing"
+# Damaged segments are copied here rather than deleted. See Spool._quarantine.
+CORRUPT_DIRNAME = "corrupt"
+CORRUPT_SUFFIX = ".corrupt"
 
 # Timestamp columns, which JSON cannot represent and Iceberg requires as real
 # timestamptz values. Listed explicitly rather than sniffed, because a
@@ -90,6 +94,15 @@ class SpoolEnvelope:
         return self.prediction["prediction_id"]
 
 
+class CorruptSegmentWarning(UserWarning):
+    """A spool segment held an unreadable line that was not its last.
+
+    The final line of a segment can be torn by a crash mid-write and is
+    tolerated. An earlier one cannot be explained that way: the append that wrote
+    it returned, so its decision was served.
+    """
+
+
 @dataclass
 class FlushResult:
     predictions_written: int = 0
@@ -97,6 +110,8 @@ class FlushResult:
     envelopes_skipped: int = 0
     segments_drained: int = 0
     orphans_cleaned: int = 0
+    segments_quarantined: int = 0
+    corrupt_lines: int = 0
 
     def __bool__(self) -> bool:
         return bool(self.predictions_written or self.envelopes_skipped)
@@ -236,7 +251,18 @@ class Spool:
             # Another drainer took it. Not an error — flush is idempotent.
             return
 
-        envelopes = _read_segment(claimed)
+        envelopes, corrupt_lines = _read_segment(claimed)
+        if corrupt_lines:
+            # Every line but the last was written by a completed, fsynced append
+            # whose response has already reached a caller. One of them being
+            # unreadable is not an expected condition — it is disk or filesystem
+            # damage — and the old code stepped over it, discarding an
+            # acknowledged decision with nothing anywhere recording that it
+            # existed. Keep the bytes, say so, and still commit what parsed.
+            result.corrupt_lines += len(corrupt_lines)
+            result.segments_quarantined += 1
+            self._quarantine(claimed, corrupt_lines)
+
         if not envelopes:
             claimed.unlink(missing_ok=True)
             result.segments_drained += 1
@@ -264,6 +290,30 @@ class Spool:
 
         claimed.unlink(missing_ok=True)
         result.segments_drained += 1
+
+    def _quarantine(self, segment: Path, corrupt_lines: list[int]) -> Path:
+        """Copy a damaged segment aside, and say loudly that it happened.
+
+        A copy rather than a move: the parseable envelopes are still committed
+        from the original in the normal way, so the audit trail is as complete as
+        the bytes allow, and the quarantined file is evidence — the only remaining
+        record of the lines that could not be read.
+        """
+        quarantine_dir = self.directory / CORRUPT_DIRNAME
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        destination = quarantine_dir / f"{segment.name}.{_stamp()}{CORRUPT_SUFFIX}"
+        destination.write_bytes(segment.read_bytes())
+
+        warnings.warn(
+            f"spool segment {segment.name} has {len(corrupt_lines)} unreadable "
+            f"line(s) at {corrupt_lines} that are not the final line, so they were "
+            f"fully written and their decisions were already served. Every line "
+            f"that parsed has been committed; the segment is preserved at "
+            f"{destination} as the only remaining record of the rest.",
+            CorruptSegmentWarning,
+            stacklevel=2,
+        )
+        return destination
 
     def _claim(self, segment: Path) -> Path | None:
         claimed = segment.with_suffix(CLAIMED_SUFFIX)
@@ -308,23 +358,35 @@ def _parse_ts(record: dict[str, Any], ts_fields: tuple[str, ...]) -> dict[str, A
     return out
 
 
-def _read_segment(segment: Path) -> list[SpoolEnvelope]:
-    """Parse a segment, tolerating a torn final line.
+def _read_segment(segment: Path) -> tuple[list[SpoolEnvelope], list[int]]:
+    """Parse a segment. Returns ``(envelopes, corrupt_line_numbers)``.
 
-    A crash mid-``write`` can leave a partial last line. That decision was never
-    acknowledged to a caller — the response is sent only after fsync returns — so
-    dropping it loses nothing, whereas refusing to parse the segment would strand
-    every complete decision ahead of it.
+    A crash mid-``write`` can leave a partial **last** line. That decision was
+    never acknowledged to a caller — the response is sent only after fsync
+    returns — so dropping it loses nothing, whereas refusing to parse the segment
+    would strand every complete decision ahead of it.
+
+    That reasoning covers exactly one line, and it used to be applied to all of
+    them. Any *earlier* unreadable line is a different event: it was written by
+    an append that returned, so a caller was told a decision had been recorded.
+    Silently skipping it deletes that decision from the only place it exists.
+    Those line numbers come back to the caller, which preserves the file and
+    warns, rather than being swallowed here.
     """
-    envelopes = []
-    for line in segment.read_text(encoding="utf-8").splitlines():
+    envelopes: list[SpoolEnvelope] = []
+    corrupt: list[int] = []
+    lines = segment.read_text(encoding="utf-8").splitlines()
+    last = len(lines) - 1
+
+    for number, line in enumerate(lines):
         if not line.strip():
             continue
         try:
             envelopes.append(_decode(json.loads(line)))
-        except (json.JSONDecodeError, KeyError):
-            continue
-    return envelopes
+        except (json.JSONDecodeError, KeyError, TypeError):
+            if number != last:
+                corrupt.append(number + 1)  # 1-based, for a human reading a file
+    return envelopes, corrupt
 
 
 # ------------------------------------------------------------- reading ----

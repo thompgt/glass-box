@@ -20,6 +20,7 @@ import threading
 
 import pytest
 
+import glassbox.serve.spool as spool_module
 from glassbox.schemas import ATTRIBUTIONS, PREDICTIONS
 from glassbox.serve import Spool, SpoolEnvelope
 from glassbox.writer import append_records
@@ -223,7 +224,42 @@ def test_a_torn_final_line_does_not_strand_the_decisions_ahead_of_it(spool, cata
     result = spool.flush(catalog)
 
     assert result.predictions_written == 2
+    assert result.segments_quarantined == 0, "a torn final line is expected, not damage"
     assert {r["prediction_id"] for r in rows(catalog, PREDICTIONS)} == {"p1", "p2"}
+
+
+def test_a_corrupt_line_that_is_not_the_last_is_preserved_and_announced(spool, catalog):
+    """An unreadable line in the middle of a segment is damage, not a torn write.
+
+    The final-line tolerance is justified by the append protocol: a partial last
+    line belongs to a write that never returned, so its decision was never
+    served. That argument covers exactly one line. An earlier one was written by
+    an append that fsynced and returned, which means a caller was told the
+    decision was recorded — and the segment is the only place it exists. The old
+    loop skipped every unreadable line alike, deleting an acknowledged decision
+    with no record that it had ever been made.
+    """
+    for pid in ("p1", "p2", "p3"):
+        spool.append(envelope(pid))
+
+    segment = spool.pending()[0]
+    lines = segment.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1][:40]  # damage the middle line, keep the last one intact
+    segment.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.warns(spool_module.CorruptSegmentWarning, match="line"):
+        result = spool.flush(catalog)
+
+    # What could be read is still committed — the damage must not strand the
+    # decisions around it.
+    assert {r["prediction_id"] for r in rows(catalog, PREDICTIONS)} == {"p1", "p3"}
+    assert result.corrupt_lines == 1
+    assert result.segments_quarantined == 1
+
+    # And the bytes survive as the only remaining record of the lost decision.
+    quarantined = list((spool.directory / spool_module.CORRUPT_DIRNAME).iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8").splitlines()[1] == lines[1]
 
 
 def test_a_segment_being_drained_is_invisible_to_a_second_flush(spool, catalog, monkeypatch):
