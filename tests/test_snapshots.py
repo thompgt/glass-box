@@ -6,9 +6,16 @@ from pathlib import Path
 
 import pytest
 
+from glassbox.digest import digest_arrow_table
 from glassbox.ingest import adult, ingest_adult
 from glassbox.schemas import CREDIT_APPLICATIONS, DATA_SNAPSHOTS, EVAL_HOLDOUT
-from glassbox.snapshots import capture_snapshot, get_snapshot, materialize, sorted_scan
+from glassbox.snapshots import (
+    DIGEST_EXCLUDE,
+    capture_snapshot,
+    get_snapshot,
+    materialize,
+    sorted_scan,
+)
 from glassbox.writer import append_arrow
 
 
@@ -91,6 +98,61 @@ def test_materialize_returns_the_pinned_rows_after_new_data_lands(
     fresh = capture_snapshot(catalog, CREDIT_APPLICATIONS, split="train")
     assert fresh.data_snapshot_uuid != ingested.train_snapshot.data_snapshot_uuid
     assert fresh.content_digest != ingested.train_snapshot.content_digest
+
+
+def test_capture_digests_the_snapshot_it_pins_not_the_live_table(
+    ingested, catalog, adult_file: Path, gb_root: Path, monkeypatch
+):
+    """A capture must describe the id it records, even if the table moves mid-capture.
+
+    ``capture_snapshot`` reads ``current_snapshot()`` and then scans. If the scan
+    is unpinned, a commit landing in that window is digested into a record that
+    names an earlier snapshot id — so reproduction, which re-reads by id, sees a
+    digest mismatch and reports data it can prove is untouched as tampered with.
+
+    The concurrent commit is injected inside the scan so the window is hit every
+    run rather than once in a thousand.
+    """
+    import glassbox.snapshots as snapshots_module
+
+    extra_path = gb_root / "data" / "raw" / "extra.data"
+    extra_path.write_text(
+        "\n".join(
+            line.replace("Bachelors", "Doctorate")
+            for line in adult_file.read_text(encoding="utf-8").splitlines()[:50]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    real_scan = snapshots_module.sorted_scan
+    intruded = False
+
+    def scan_after_a_concurrent_commit(catalog, td, **kwargs):
+        nonlocal intruded
+        if not intruded:
+            intruded = True
+            append_arrow(
+                catalog,
+                CREDIT_APPLICATIONS,
+                adult.parse_adult(extra_path, ingest_batch_id="concurrent"),
+            )
+        return real_scan(catalog, td, **kwargs)
+
+    monkeypatch.setattr(snapshots_module, "sorted_scan", scan_after_a_concurrent_commit)
+    snap = capture_snapshot(catalog, CREDIT_APPLICATIONS, split="train")
+    monkeypatch.undo()
+
+    assert intruded, "the concurrent commit never ran"
+    # The record describes the snapshot it names: re-reading by that id and
+    # digesting again must reproduce the recorded digest exactly.
+    replayed = materialize(catalog, snap, CREDIT_APPLICATIONS)
+    replayed_digest, _ = digest_arrow_table(replayed, exclude=DIGEST_EXCLUDE)
+    assert replayed_digest == snap.content_digest
+    assert replayed.num_rows == snap.row_count
+    # And it is still the pre-intrusion data version, unchanged by the commit.
+    assert snap.data_snapshot_uuid == ingested.train_snapshot.data_snapshot_uuid
+    assert snap.content_digest == ingested.train_snapshot.content_digest
 
 
 def test_eval_holdout_is_frozen_across_reingest(ingested, catalog, gb_root: Path):
