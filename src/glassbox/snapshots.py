@@ -122,7 +122,16 @@ def capture_snapshot(
     filter_expr = f"split == '{split}'" if split else None
     row_filter = EqualTo("split", split) if split else None
 
-    arrow = sorted_scan(catalog, td, row_filter=row_filter)
+    # Pinned to the id being recorded, not left to read "whatever is current
+    # now". An unpinned scan digests the table as of the moment it runs, so a
+    # commit landing between current_snapshot() and the scan produces a record
+    # whose content_digest describes rows the iceberg_snapshot_id it names does
+    # not contain. Reproduction re-reads by id, gets the pinned rows, and reports
+    # a digest mismatch as "the data moved under me" — a false accusation of
+    # exactly the tampering this table exists to detect.
+    arrow = sorted_scan(
+        catalog, td, iceberg_snapshot_id=current.snapshot_id, row_filter=row_filter
+    )
     digest, row_digests = digest_arrow_table(arrow, exclude=DIGEST_EXCLUDE)
 
     min_ts = max_ts = None

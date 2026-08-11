@@ -77,6 +77,7 @@ def probe(name: str, question: str):
 
 
 def main() -> int:
+    import pyiceberg
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.expressions import EqualTo
     from pyiceberg.partitioning import PartitionField, PartitionSpec
@@ -87,8 +88,6 @@ def main() -> int:
         StringType,
         TimestamptzType,
     )
-
-    import pyiceberg
 
     tmp = Path(tempfile.mkdtemp(prefix="glassbox-spike-"))
     warehouse = tmp / "warehouse"
@@ -113,7 +112,7 @@ def main() -> int:
     )
 
     def rows(n: int, offset: int = 0) -> pa.Table:
-        base = dt.datetime(2026, 3, 14, 12, 0, tzinfo=dt.timezone.utc)
+        base = dt.datetime(2026, 3, 14, 12, 0, tzinfo=dt.UTC)
         return pa.table(
             {
                 "subject_id": [f"s{i + offset:04d}" for i in range(n)],

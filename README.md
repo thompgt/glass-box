@@ -81,12 +81,38 @@ py -3.12 -m venv .venv
 pip install -e ".[dev]"
 ```
 
-Optional extras are installed per phase to keep early resolution fast:
+That is everything the commands below need — SHAP included. Attribution is not
+an extra: every served prediction computes its SHAP values before the response
+is built, so an install without it cannot run `glassbox predict`.
+
+One optional extra remains, for the alternative model families:
 
 ```bash
-pip install -e ".[dev,explain]"    # Phase 3 onward — SHAP
-pip install -e ".[dev,automl]"     # Phase 4 onward — FLAML, LightGBM, XGBoost
+pip install -e ".[dev,automl]"     # FLAML, LightGBM, XGBoost
 ```
+
+### The lockfile
+
+`requirements.lock` pins the exact environment, and its SHA-256 is the
+`env_digest` recorded on every model version. `glassbox reproduce` refuses to
+compare artifacts across a change to it: scikit-learn's solvers and NumPy's
+reductions are not bit-stable across releases, so retraining under different
+wheels is a different experiment and reporting the difference as "not
+reproducible" would be a lie.
+
+The `>=` ranges in `pyproject.toml` describe what glassbox is *compatible* with;
+the lock describes what a recorded artifact was actually *built* under. Install
+from it for bit-exact work, and regenerate it after any intentional dependency
+change:
+
+```bash
+pip install -r requirements.lock
+python -m pip freeze --exclude-editable > requirements.lock   # after a bump
+```
+
+With no lock present, `env_digest` warns and records `"unlocked"`, and
+`reproduce` refuses to accept `"unlocked" == "unlocked"` as evidence that two
+environments agree. `GLASSBOX_LOCKFILE` points at a lock elsewhere.
 
 ## Usage
 

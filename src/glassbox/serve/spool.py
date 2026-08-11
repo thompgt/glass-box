@@ -40,6 +40,7 @@ import json
 import os
 import threading
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,9 @@ PENDING_SUFFIX = ".jsonl"
 # concurrent writer appending to the live segment cannot have its rows consumed
 # and then unlinked underneath it.
 CLAIMED_SUFFIX = ".flushing"
+# Damaged segments are copied here rather than deleted. See Spool._quarantine.
+CORRUPT_DIRNAME = "corrupt"
+CORRUPT_SUFFIX = ".corrupt"
 
 # Timestamp columns, which JSON cannot represent and Iceberg requires as real
 # timestamptz values. Listed explicitly rather than sniffed, because a
@@ -90,6 +94,15 @@ class SpoolEnvelope:
         return self.prediction["prediction_id"]
 
 
+class CorruptSegmentWarning(UserWarning):
+    """A spool segment held an unreadable line that was not its last.
+
+    The final line of a segment can be torn by a crash mid-write and is
+    tolerated. An earlier one cannot be explained that way: the append that wrote
+    it returned, so its decision was served.
+    """
+
+
 @dataclass
 class FlushResult:
     predictions_written: int = 0
@@ -97,6 +110,8 @@ class FlushResult:
     envelopes_skipped: int = 0
     segments_drained: int = 0
     orphans_cleaned: int = 0
+    segments_quarantined: int = 0
+    corrupt_lines: int = 0
 
     def __bool__(self) -> bool:
         return bool(self.predictions_written or self.envelopes_skipped)
@@ -114,10 +129,36 @@ class Spool:
     # writes would tear both lines, and a rotation racing an append would drop
     # one into a segment that is already being drained.
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Serializes whole flushes. The append lock is not enough: it is released the
+    # moment a segment is claimed, so two flushes could each claim a *different*
+    # segment and interleave their Iceberg commits — and, worse, a flush entering
+    # while another is mid-drain used to see the in-flight ``.flushing`` file and
+    # drain it a second time. One flush at a time per process.
+    _flush_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Segments a *previous* process claimed and never finished. Determined once,
+    # at construction, because that is the only moment at which a ``.flushing``
+    # file is unambiguously stale: after this object exists, every such file is
+    # either one of these or one this process is draining right now.
+    _recoverable: set[Path] = field(default_factory=set, init=False, repr=False)
+
+    _pending: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._recoverable = self._scan_recoverable()
+        # The one full scan, at startup, where it is unavoidable: this process
+        # has to learn what a previous one left behind. From here the count is
+        # maintained incrementally.
+        self._pending = self.count_pending_on_disk()
 
     @property
     def directory(self) -> Path:
         return Path(self.root) / SPOOL_DIRNAME
+
+    def _scan_recoverable(self) -> set[Path]:
+        """Claimed-but-undrained segments left behind by a previous process."""
+        if not self.directory.exists():
+            return set()
+        return {p for p in self.directory.iterdir() if p.suffix == CLAIMED_SUFFIX}
 
     # ------------------------------------------------------------- writing ----
 
@@ -140,6 +181,7 @@ class Spool:
                 os.fsync(fh.fileno())
 
             self._appended += 1
+            self._pending += 1
             if self._appended >= self.batch_size:
                 self._segment = None
                 self._appended = 0
@@ -161,16 +203,44 @@ class Spool:
         return self._segment
 
     def pending(self) -> list[Path]:
+        """Segments awaiting a commit: unclaimed ones, plus crash leftovers.
+
+        A ``.flushing`` segment is included **only** when it was already on disk
+        when this Spool was constructed. Returning every ``.flushing`` file would
+        hand a caller a segment another flush is actively draining, and both
+        drainers would then miss each other's existence check and append the same
+        audit rows twice — the exact duplication this module exists to prevent.
+        """
         if not self.directory.exists():
             return []
-        return sorted(
-            p
-            for p in self.directory.iterdir()
-            if p.suffix in (PENDING_SUFFIX, CLAIMED_SUFFIX)
-        )
+        live = [p for p in self.directory.iterdir() if p.suffix == PENDING_SUFFIX]
+        stale = [p for p in self._recoverable if p.exists()]
+        return sorted(live + stale)
 
     def pending_count(self) -> int:
-        """Decisions recorded on disk but not yet committed to Iceberg."""
+        """Decisions recorded on disk but not yet committed to Iceberg.
+
+        O(1). This is read by ``/health`` and by every explanation lookup that
+        misses, so it cannot cost a full read of the spool: a stalled flush turns
+        a liveness probe into an O(spool) scan, which makes the probe slowest
+        exactly when the spool is deepest and the answer matters most — and a
+        health check that times out under backlog reports the service as dead.
+
+        Maintained from appends and drains against the count established by
+        :meth:`count_pending_on_disk` at construction. It therefore describes
+        *this* process's view; another process appending to the same root is
+        invisible until this one is restarted, which is the same scope as
+        ``_segment`` and ``_recoverable``.
+        """
+        return self._pending
+
+    def count_pending_on_disk(self) -> int:
+        """Count spooled decisions by reading every pending segment.
+
+        The authoritative but expensive answer. Used once at construction, to
+        recover the count a previous process left behind, and available to the
+        CLI, which is a fresh process anyway.
+        """
         return sum(
             sum(1 for line in p.read_text(encoding="utf-8").splitlines() if line.strip())
             for p in self.pending()
@@ -185,15 +255,19 @@ class Spool:
         CLI command. Segments are drained oldest-first so the audit trail's
         commit order matches the order decisions were served.
         """
-        result = FlushResult()
-        for segment in self.pending():
-            self._drain_segment(catalog, segment, result)
-        return result
+        with self._flush_lock:
+            result = FlushResult()
+            for segment in self.pending():
+                self._drain_segment(catalog, segment, result)
+            return result
 
     def _drain_segment(self, catalog, segment: Path, result: FlushResult) -> None:
-        recovered = segment.suffix == CLAIMED_SUFFIX
-
         with self._lock:
+            # Claiming a recovered segment is removing it from the recovery set:
+            # its ``.flushing`` name is already the claim, and taking it out here
+            # means a second drainer cannot also treat it as recoverable.
+            recovered = segment in self._recoverable
+            self._recoverable.discard(segment)
             if segment == self._segment:
                 # Retire the live segment before renaming it, so an append racing
                 # this flush opens a new file rather than writing rows into a
@@ -206,9 +280,20 @@ class Spool:
             # Another drainer took it. Not an error — flush is idempotent.
             return
 
-        envelopes = _read_segment(claimed)
+        envelopes, corrupt_lines, lines_held = _read_segment(claimed)
+        if corrupt_lines:
+            # Every line but the last was written by a completed, fsynced append
+            # whose response has already reached a caller. One of them being
+            # unreadable is not an expected condition — it is disk or filesystem
+            # damage — and the old code stepped over it, discarding an
+            # acknowledged decision with nothing anywhere recording that it
+            # existed. Keep the bytes, say so, and still commit what parsed.
+            result.corrupt_lines += len(corrupt_lines)
+            result.segments_quarantined += 1
+            self._quarantine(claimed, corrupt_lines)
+
         if not envelopes:
-            claimed.unlink(missing_ok=True)
+            self._release(claimed, lines_held)
             result.segments_drained += 1
             return
 
@@ -232,8 +317,38 @@ class Spool:
                 catalog, PREDICTIONS, [e.prediction for e in fresh]
             )
 
-        claimed.unlink(missing_ok=True)
+        self._release(claimed, lines_held)
         result.segments_drained += 1
+
+    def _release(self, claimed: Path, lines_held: int) -> None:
+        """Unlink a drained segment and take its rows off the pending count."""
+        claimed.unlink(missing_ok=True)
+        with self._lock:
+            self._pending = max(0, self._pending - lines_held)
+
+    def _quarantine(self, segment: Path, corrupt_lines: list[int]) -> Path:
+        """Copy a damaged segment aside, and say loudly that it happened.
+
+        A copy rather than a move: the parseable envelopes are still committed
+        from the original in the normal way, so the audit trail is as complete as
+        the bytes allow, and the quarantined file is evidence — the only remaining
+        record of the lines that could not be read.
+        """
+        quarantine_dir = self.directory / CORRUPT_DIRNAME
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        destination = quarantine_dir / f"{segment.name}.{_stamp()}{CORRUPT_SUFFIX}"
+        destination.write_bytes(segment.read_bytes())
+
+        warnings.warn(
+            f"spool segment {segment.name} has {len(corrupt_lines)} unreadable "
+            f"line(s) at {corrupt_lines} that are not the final line, so they were "
+            f"fully written and their decisions were already served. Every line "
+            f"that parsed has been committed; the segment is preserved at "
+            f"{destination} as the only remaining record of the rest.",
+            CorruptSegmentWarning,
+            stacklevel=2,
+        )
+        return destination
 
     def _claim(self, segment: Path) -> Path | None:
         claimed = segment.with_suffix(CLAIMED_SUFFIX)
@@ -278,23 +393,41 @@ def _parse_ts(record: dict[str, Any], ts_fields: tuple[str, ...]) -> dict[str, A
     return out
 
 
-def _read_segment(segment: Path) -> list[SpoolEnvelope]:
-    """Parse a segment, tolerating a torn final line.
+def _read_segment(segment: Path) -> tuple[list[SpoolEnvelope], list[int], int]:
+    """Parse a segment. Returns ``(envelopes, corrupt_line_numbers, lines_held)``.
 
-    A crash mid-``write`` can leave a partial last line. That decision was never
-    acknowledged to a caller — the response is sent only after fsync returns — so
-    dropping it loses nothing, whereas refusing to parse the segment would strand
-    every complete decision ahead of it.
+    ``lines_held`` is every non-empty line, parseable or not — what the segment
+    was contributing to :meth:`Spool.pending_count`, so that draining it can
+    subtract exactly what appending it added.
+
+    A crash mid-``write`` can leave a partial **last** line. That decision was
+    never acknowledged to a caller — the response is sent only after fsync
+    returns — so dropping it loses nothing, whereas refusing to parse the segment
+    would strand every complete decision ahead of it.
+
+    That reasoning covers exactly one line, and it used to be applied to all of
+    them. Any *earlier* unreadable line is a different event: it was written by
+    an append that returned, so a caller was told a decision had been recorded.
+    Silently skipping it deletes that decision from the only place it exists.
+    Those line numbers come back to the caller, which preserves the file and
+    warns, rather than being swallowed here.
     """
-    envelopes = []
-    for line in segment.read_text(encoding="utf-8").splitlines():
+    envelopes: list[SpoolEnvelope] = []
+    corrupt: list[int] = []
+    held = 0
+    lines = segment.read_text(encoding="utf-8").splitlines()
+    last = len(lines) - 1
+
+    for number, line in enumerate(lines):
         if not line.strip():
             continue
+        held += 1
         try:
             envelopes.append(_decode(json.loads(line)))
-        except (json.JSONDecodeError, KeyError):
-            continue
-    return envelopes
+        except (json.JSONDecodeError, KeyError, TypeError):
+            if number != last:
+                corrupt.append(number + 1)  # 1-based, for a human reading a file
+    return envelopes, corrupt, held
 
 
 # ------------------------------------------------------------- reading ----

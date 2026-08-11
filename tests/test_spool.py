@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import threading
 
 import pytest
 
+import glassbox.serve.spool as spool_module
 from glassbox.schemas import ATTRIBUTIONS, PREDICTIONS
 from glassbox.serve import Spool, SpoolEnvelope
 from glassbox.writer import append_records
@@ -222,7 +224,91 @@ def test_a_torn_final_line_does_not_strand_the_decisions_ahead_of_it(spool, cata
     result = spool.flush(catalog)
 
     assert result.predictions_written == 2
+    assert result.segments_quarantined == 0, "a torn final line is expected, not damage"
     assert {r["prediction_id"] for r in rows(catalog, PREDICTIONS)} == {"p1", "p2"}
+
+
+def test_a_corrupt_line_that_is_not_the_last_is_preserved_and_announced(spool, catalog):
+    """An unreadable line in the middle of a segment is damage, not a torn write.
+
+    The final-line tolerance is justified by the append protocol: a partial last
+    line belongs to a write that never returned, so its decision was never
+    served. That argument covers exactly one line. An earlier one was written by
+    an append that fsynced and returned, which means a caller was told the
+    decision was recorded — and the segment is the only place it exists. The old
+    loop skipped every unreadable line alike, deleting an acknowledged decision
+    with no record that it had ever been made.
+    """
+    for pid in ("p1", "p2", "p3"):
+        spool.append(envelope(pid))
+
+    segment = spool.pending()[0]
+    lines = segment.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1][:40]  # damage the middle line, keep the last one intact
+    segment.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.warns(spool_module.CorruptSegmentWarning, match="line"):
+        result = spool.flush(catalog)
+
+    # What could be read is still committed — the damage must not strand the
+    # decisions around it.
+    assert {r["prediction_id"] for r in rows(catalog, PREDICTIONS)} == {"p1", "p3"}
+    assert result.corrupt_lines == 1
+    assert result.segments_quarantined == 1
+
+    # And the bytes survive as the only remaining record of the lost decision.
+    quarantined = list((spool.directory / spool_module.CORRUPT_DIRNAME).iterdir())
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8").splitlines()[1] == lines[1]
+
+
+def test_a_segment_being_drained_is_invisible_to_a_second_flush(spool, catalog, monkeypatch):
+    """Concurrent flushes must not both drain the same in-flight segment.
+
+    Three callers flush this spool in a live process — the 5s background tick,
+    a read-miss lookup, and the shutdown hook — and they can overlap. A claimed
+    segment used to stay visible to :meth:`pending`, and ``_drain_segment``
+    treated *any* claimed segment as recovered from a previous process: it would
+    skip the atomic claim, delete the attributions the first flush had just
+    written as though they were crash orphans, and append the whole envelope a
+    second time. Duplicate rows in an audit table are the one outcome this module
+    exists to make impossible.
+
+    The first flush is held open inside its attributions commit so the race is
+    deterministic rather than timing-dependent.
+    """
+    import glassbox.serve.spool as spool_module
+
+    real = spool_module.append_records
+    inside = threading.Event()
+    seen_by_second: list[list] = []
+    release = threading.Event()
+
+    def blocking(catalog, td, records):
+        if td.name == ATTRIBUTIONS.name:
+            inside.set()
+            release.wait(30)
+        return real(catalog, td, records)
+
+    monkeypatch.setattr(spool_module, "append_records", blocking)
+    spool.append(envelope("p1"))
+
+    first = threading.Thread(target=spool.flush, args=(catalog,))
+    first.start()
+    assert inside.wait(30), "the first flush never reached its commit"
+
+    # Mid-drain: the segment is claimed and must not be offered to anyone else.
+    seen_by_second.append(spool.pending())
+
+    second = threading.Thread(target=spool.flush, args=(catalog,))
+    second.start()
+    release.set()
+    first.join(30)
+    second.join(30)
+
+    assert seen_by_second[0] == [], "an in-flight segment was offered to a second flush"
+    assert len(rows(catalog, PREDICTIONS)) == 1
+    assert len(rows(catalog, ATTRIBUTIONS)) == 3, "attributions were double-written"
 
 
 # --------------------------------------------------------------- batching ----
@@ -234,6 +320,38 @@ def test_a_full_batch_rotates_to_a_new_segment(gb_root):
 
     assert len(spool.pending()) == 3
     assert spool.pending_count() == 5
+
+
+def test_pending_count_does_not_read_the_spool(spool, monkeypatch):
+    """/health and every missed lookup call this, so it must not scan the spool.
+
+    Reading every pending segment made a liveness probe O(spool) — slowest
+    precisely when the backlog is deepest and the answer matters most, and a
+    health check that times out under backlog reports a working service as dead.
+    """
+    from pathlib import Path
+
+    for i in range(5):
+        spool.append(envelope(f"p{i}"))
+
+    def explode(*args, **kwargs):
+        raise AssertionError("pending_count read a segment off disk")
+
+    monkeypatch.setattr(Path, "read_text", explode)
+    assert spool.pending_count() == 5
+
+
+def test_the_pending_count_is_recovered_from_disk_at_startup(gb_root, catalog):
+    """The incremental counter has to start from what a dead process left behind."""
+    first = Spool(root=gb_root, batch_size=2)
+    for i in range(3):
+        first.append(envelope(f"p{i}"))
+
+    reborn = Spool(root=gb_root, batch_size=2)
+    assert reborn.pending_count() == 3 == reborn.count_pending_on_disk()
+
+    reborn.flush(catalog)
+    assert reborn.pending_count() == 0 == reborn.count_pending_on_disk()
 
 
 def test_flushing_an_empty_spool_is_a_no_op(spool, catalog):

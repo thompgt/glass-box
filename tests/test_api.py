@@ -111,6 +111,33 @@ def test_an_unknown_feature_is_a_422(client):
     assert "favourite_colour" in response.json()["detail"]
 
 
+def test_an_unparseable_feature_value_is_a_422_not_a_500(client):
+    """A malformed value is the caller's mistake, and the status must say so.
+
+    ``to_row`` calls ``float(value)`` on every numeric feature. An unhandled
+    ValueError there surfaced as a 500 — a claim that the *service* is broken —
+    for a request that is simply wrong, which sends whoever is on call to
+    investigate a system that is behaving correctly.
+    """
+    response = client.post("/predictions", json={**APPLICANT, "age": "old"})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "age" in detail and "old" in detail
+
+
+@pytest.mark.parametrize("bad", ["high", "", "50", "-0.1", "1.5"])
+def test_a_threshold_outside_zero_to_one_is_refused_at_app_creation(tmp_path, bad):
+    """An out-of-range threshold is a constant decision wearing a model's clothes.
+
+    ``GLASSBOX_THRESHOLD=50`` — percent, plausibly — denies every applicant while
+    every audit row records a score that never mattered. Caught at construction,
+    the one moment there is still a human reading the output.
+    """
+    with pytest.raises(ValueError, match="THRESHOLD"):
+        create_app(root=tmp_path, model_version_id="mv-1", threshold=bad)
+
+
 def test_an_unknown_prediction_id_is_a_404(client):
     response = client.get("/explanations/not-a-real-prediction")
 

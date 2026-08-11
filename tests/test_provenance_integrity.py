@@ -115,3 +115,78 @@ def test_every_table_has_a_derivable_arrow_schema(td):
 
 def test_ingest_arrow_schema_matches_the_feature_table():
     assert adult.arrow_schema() == arrow_schema_for(CREDIT_APPLICATIONS)
+
+
+# ------------------------------------------------------------ code sha ----
+
+def test_code_git_sha_describes_the_code_not_the_data_root(gb_root: Path, monkeypatch):
+    """Training provenance must point at the source tree, not the warehouse.
+
+    ``code_git_sha`` used to run ``git rev-parse`` with ``glassbox_root()`` as
+    its cwd. The root is where *data* lives and is routinely pointed elsewhere —
+    a tmp_path here, a mounted volume in a container. Asking git about it records
+    either "unknown" or, if that directory happens to sit in some other
+    repository, that repository's commit, presented as the provenance of this
+    model's code.
+    """
+    import subprocess
+
+    from glassbox.train.tracking import UNKNOWN_GIT_SHA, code_git_sha
+
+    source = Path(adult.__file__).resolve().parent
+    try:
+        expected = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        pytest.skip("glassbox source is not inside a git checkout")
+
+    # GLASSBOX_ROOT points at a tmp_path with no repository in it.
+    code_git_sha.cache_clear()
+    try:
+        reported = code_git_sha()
+    finally:
+        code_git_sha.cache_clear()
+
+    assert reported != UNKNOWN_GIT_SHA
+    assert reported.startswith(expected)
+
+
+# ----------------------------------------------------------- environment ----
+
+def test_env_digest_is_the_hash_of_the_lockfile(tmp_path: Path):
+    from glassbox.digest import env_digest, sha256_hex
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_bytes(b"numpy==2.4.6\n")
+    assert env_digest(lock) == sha256_hex(b"numpy==2.4.6\n")
+
+    lock.write_bytes(b"numpy==2.4.7\n")
+    assert env_digest(lock) != sha256_hex(b"numpy==2.4.6\n")
+
+
+def test_the_repository_ships_a_lockfile():
+    """Without one the drift guard is vacuous.
+
+    ``env_digest`` degrades to a constant when no lock is found, so every model
+    version records the same value and reproduction compares it to itself — a
+    check that passes unconditionally while NumPy is free to move underneath it.
+    A guard reported as checked but incapable of failing is worse than no guard.
+    """
+    from glassbox.digest import UNLOCKED, env_digest, find_lockfile
+
+    lock = find_lockfile()
+    assert lock is not None and lock.exists(), "requirements.lock is not committed"
+    assert env_digest() != UNLOCKED
+
+
+def test_a_missing_lockfile_is_announced_not_swallowed(tmp_path: Path, monkeypatch):
+    from glassbox.digest import UNLOCKED, UnlockedEnvironmentWarning, env_digest
+
+    monkeypatch.setenv("GLASSBOX_LOCKFILE", str(tmp_path / "does-not-exist.lock"))
+    with pytest.warns(UnlockedEnvironmentWarning):
+        assert env_digest() == UNLOCKED

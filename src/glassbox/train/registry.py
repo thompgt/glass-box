@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,10 +29,21 @@ from ..digest import canonical_json, env_digest
 from ..schemas import MODEL_VERSIONS, TRAINING_MEMBERSHIP
 from ..writer import append_records
 from .canonical import canonical_bytes, model_digest
-from .tracking import EXPERIMENT, code_git_sha, configure_mlflow
+from .tracking import EXPERIMENT, UNKNOWN_GIT_SHA, code_git_sha, configure_mlflow
 
 CANONICAL_ARTIFACT = "canonical_model.json"
 MODEL_ARTIFACT = "model"
+
+
+class IncompleteProvenanceWarning(UserWarning):
+    """A model was registered with a provenance field that could not be resolved.
+
+    Not an error — refusing to train because the source tree is not a git
+    checkout would make the tool unusable from a wheel — but not silent either.
+    A ``code_git_sha`` of ``"unknown"`` looks identical in the table to one that
+    was never going to be checked, and the whole point of the column is that
+    somebody can go and read the code that produced the artifact.
+    """
 
 
 class ProvenanceIntegrityError(RuntimeError):
@@ -108,6 +120,17 @@ def register(
     digest = model_digest(model)
     model_version_id = str(uuid.uuid4())
 
+    git_sha = code_git_sha()
+    if git_sha == UNKNOWN_GIT_SHA:
+        warnings.warn(
+            f"registering {model_version_id} with code_git_sha={UNKNOWN_GIT_SHA!r}: "
+            f"the installed glassbox source is not inside a git checkout, so this "
+            f"model version records no pointer to the code that produced it. The "
+            f"artifact digest still pins the model; the source does not.",
+            IncompleteProvenanceWarning,
+            stacklevel=2,
+        )
+
     # --- MLflow first ------------------------------------------------------
     with mlflow.start_run(experiment_id=experiment_id, run_name=model_version_id) as run:
         mlflow.set_tags(
@@ -145,7 +168,7 @@ def register(
         seed=seed,
         artifact_digest=digest,
         env_digest=env_digest(),
-        code_git_sha=code_git_sha(),
+        code_git_sha=git_sha,
         metrics=metrics,
         registered_name=registered_name,
         status=status,

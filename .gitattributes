@@ -1,0 +1,5 @@
+# The environment digest is the SHA-256 of these bytes (glassbox.digest.env_digest).
+# Left to core.autocrlf it would be CRLF on Windows and LF elsewhere, so the same
+# pinned environment would report two different digests and reproduce would call
+# a platform difference environment drift. Pinned to LF everywhere.
+requirements.lock text eol=lf
