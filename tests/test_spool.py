@@ -322,6 +322,38 @@ def test_a_full_batch_rotates_to_a_new_segment(gb_root):
     assert spool.pending_count() == 5
 
 
+def test_pending_count_does_not_read_the_spool(spool, monkeypatch):
+    """/health and every missed lookup call this, so it must not scan the spool.
+
+    Reading every pending segment made a liveness probe O(spool) — slowest
+    precisely when the backlog is deepest and the answer matters most, and a
+    health check that times out under backlog reports a working service as dead.
+    """
+    from pathlib import Path
+
+    for i in range(5):
+        spool.append(envelope(f"p{i}"))
+
+    def explode(*args, **kwargs):
+        raise AssertionError("pending_count read a segment off disk")
+
+    monkeypatch.setattr(Path, "read_text", explode)
+    assert spool.pending_count() == 5
+
+
+def test_the_pending_count_is_recovered_from_disk_at_startup(gb_root, catalog):
+    """The incremental counter has to start from what a dead process left behind."""
+    first = Spool(root=gb_root, batch_size=2)
+    for i in range(3):
+        first.append(envelope(f"p{i}"))
+
+    reborn = Spool(root=gb_root, batch_size=2)
+    assert reborn.pending_count() == 3 == reborn.count_pending_on_disk()
+
+    reborn.flush(catalog)
+    assert reborn.pending_count() == 0 == reborn.count_pending_on_disk()
+
+
 def test_flushing_an_empty_spool_is_a_no_op(spool, catalog):
     result = spool.flush(catalog)
 

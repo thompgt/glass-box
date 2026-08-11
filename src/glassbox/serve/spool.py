@@ -141,8 +141,14 @@ class Spool:
     # either one of these or one this process is draining right now.
     _recoverable: set[Path] = field(default_factory=set, init=False, repr=False)
 
+    _pending: int = field(default=0, init=False, repr=False)
+
     def __post_init__(self) -> None:
         self._recoverable = self._scan_recoverable()
+        # The one full scan, at startup, where it is unavoidable: this process
+        # has to learn what a previous one left behind. From here the count is
+        # maintained incrementally.
+        self._pending = self.count_pending_on_disk()
 
     @property
     def directory(self) -> Path:
@@ -175,6 +181,7 @@ class Spool:
                 os.fsync(fh.fileno())
 
             self._appended += 1
+            self._pending += 1
             if self._appended >= self.batch_size:
                 self._segment = None
                 self._appended = 0
@@ -211,7 +218,29 @@ class Spool:
         return sorted(live + stale)
 
     def pending_count(self) -> int:
-        """Decisions recorded on disk but not yet committed to Iceberg."""
+        """Decisions recorded on disk but not yet committed to Iceberg.
+
+        O(1). This is read by ``/health`` and by every explanation lookup that
+        misses, so it cannot cost a full read of the spool: a stalled flush turns
+        a liveness probe into an O(spool) scan, which makes the probe slowest
+        exactly when the spool is deepest and the answer matters most — and a
+        health check that times out under backlog reports the service as dead.
+
+        Maintained from appends and drains against the count established by
+        :meth:`count_pending_on_disk` at construction. It therefore describes
+        *this* process's view; another process appending to the same root is
+        invisible until this one is restarted, which is the same scope as
+        ``_segment`` and ``_recoverable``.
+        """
+        return self._pending
+
+    def count_pending_on_disk(self) -> int:
+        """Count spooled decisions by reading every pending segment.
+
+        The authoritative but expensive answer. Used once at construction, to
+        recover the count a previous process left behind, and available to the
+        CLI, which is a fresh process anyway.
+        """
         return sum(
             sum(1 for line in p.read_text(encoding="utf-8").splitlines() if line.strip())
             for p in self.pending()
@@ -251,7 +280,7 @@ class Spool:
             # Another drainer took it. Not an error — flush is idempotent.
             return
 
-        envelopes, corrupt_lines = _read_segment(claimed)
+        envelopes, corrupt_lines, lines_held = _read_segment(claimed)
         if corrupt_lines:
             # Every line but the last was written by a completed, fsynced append
             # whose response has already reached a caller. One of them being
@@ -264,7 +293,7 @@ class Spool:
             self._quarantine(claimed, corrupt_lines)
 
         if not envelopes:
-            claimed.unlink(missing_ok=True)
+            self._release(claimed, lines_held)
             result.segments_drained += 1
             return
 
@@ -288,8 +317,14 @@ class Spool:
                 catalog, PREDICTIONS, [e.prediction for e in fresh]
             )
 
-        claimed.unlink(missing_ok=True)
+        self._release(claimed, lines_held)
         result.segments_drained += 1
+
+    def _release(self, claimed: Path, lines_held: int) -> None:
+        """Unlink a drained segment and take its rows off the pending count."""
+        claimed.unlink(missing_ok=True)
+        with self._lock:
+            self._pending = max(0, self._pending - lines_held)
 
     def _quarantine(self, segment: Path, corrupt_lines: list[int]) -> Path:
         """Copy a damaged segment aside, and say loudly that it happened.
@@ -358,8 +393,12 @@ def _parse_ts(record: dict[str, Any], ts_fields: tuple[str, ...]) -> dict[str, A
     return out
 
 
-def _read_segment(segment: Path) -> tuple[list[SpoolEnvelope], list[int]]:
-    """Parse a segment. Returns ``(envelopes, corrupt_line_numbers)``.
+def _read_segment(segment: Path) -> tuple[list[SpoolEnvelope], list[int], int]:
+    """Parse a segment. Returns ``(envelopes, corrupt_line_numbers, lines_held)``.
+
+    ``lines_held`` is every non-empty line, parseable or not — what the segment
+    was contributing to :meth:`Spool.pending_count`, so that draining it can
+    subtract exactly what appending it added.
 
     A crash mid-``write`` can leave a partial **last** line. That decision was
     never acknowledged to a caller — the response is sent only after fsync
@@ -375,18 +414,20 @@ def _read_segment(segment: Path) -> tuple[list[SpoolEnvelope], list[int]]:
     """
     envelopes: list[SpoolEnvelope] = []
     corrupt: list[int] = []
+    held = 0
     lines = segment.read_text(encoding="utf-8").splitlines()
     last = len(lines) - 1
 
     for number, line in enumerate(lines):
         if not line.strip():
             continue
+        held += 1
         try:
             envelopes.append(_decode(json.loads(line)))
         except (json.JSONDecodeError, KeyError, TypeError):
             if number != last:
                 corrupt.append(number + 1)  # 1-based, for a human reading a file
-    return envelopes, corrupt
+    return envelopes, corrupt, held
 
 
 # ------------------------------------------------------------- reading ----
