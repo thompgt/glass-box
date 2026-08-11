@@ -115,3 +115,42 @@ def test_every_table_has_a_derivable_arrow_schema(td):
 
 def test_ingest_arrow_schema_matches_the_feature_table():
     assert adult.arrow_schema() == arrow_schema_for(CREDIT_APPLICATIONS)
+
+
+# ------------------------------------------------------------ code sha ----
+
+def test_code_git_sha_describes_the_code_not_the_data_root(gb_root: Path, monkeypatch):
+    """Training provenance must point at the source tree, not the warehouse.
+
+    ``code_git_sha`` used to run ``git rev-parse`` with ``glassbox_root()`` as
+    its cwd. The root is where *data* lives and is routinely pointed elsewhere —
+    a tmp_path here, a mounted volume in a container. Asking git about it records
+    either "unknown" or, if that directory happens to sit in some other
+    repository, that repository's commit, presented as the provenance of this
+    model's code.
+    """
+    import subprocess
+
+    from glassbox.train.tracking import UNKNOWN_GIT_SHA, code_git_sha
+
+    source = Path(adult.__file__).resolve().parent
+    try:
+        expected = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        pytest.skip("glassbox source is not inside a git checkout")
+
+    # GLASSBOX_ROOT points at a tmp_path with no repository in it.
+    code_git_sha.cache_clear()
+    try:
+        reported = code_git_sha()
+    finally:
+        code_git_sha.cache_clear()
+
+    assert reported != UNKNOWN_GIT_SHA
+    assert reported.startswith(expected)

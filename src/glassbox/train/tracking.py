@@ -18,6 +18,10 @@ from ..catalog import glassbox_root
 
 EXPERIMENT = "glassbox"
 
+# What gets recorded when git cannot answer. Named so callers can check for it
+# rather than string-matching, and so the check cannot drift from the value.
+UNKNOWN_GIT_SHA = "unknown"
+
 
 def configure_mlflow(root: Path | None = None) -> str:
     """Point MLflow at the local SQLite store and return the experiment id."""
@@ -42,8 +46,16 @@ def code_git_sha() -> str:
     The suffix matters: a model trained from an uncommitted working tree is not
     reproducible from the repository, and recording a bare SHA would claim
     otherwise.
+
+    Resolved against **this module's own directory**, not ``glassbox_root()``.
+    The root is where *data* lives and is routinely pointed elsewhere — at a
+    tmp_path in tests, at a data volume in a container, at a user data dir on an
+    installed copy. Asking git about it answers a question about the wrong tree:
+    at best "unknown", at worst the SHA of some unrelated repository recorded as
+    the provenance of this model's code. The code's own path is the only thing
+    that can answer "which source produced this artifact?".
     """
-    root = glassbox_root()
+    root = Path(__file__).resolve().parent
     try:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -61,4 +73,4 @@ def code_git_sha() -> str:
         ).stdout.strip()
         return f"{sha}-dirty" if dirty else sha
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return "unknown"
+        return UNKNOWN_GIT_SHA
