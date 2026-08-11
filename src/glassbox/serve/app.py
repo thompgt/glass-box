@@ -49,7 +49,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..catalog import glassbox_root, load_catalog
 from ..train.registry import ProvenanceIntegrityError
 from .explanations import DEFAULT_TOP_K, ExplanationNotFoundError, explanation_for
-from .service import DEFAULT_THRESHOLD, PredictionService, UnknownFeatureError
+from .service import (
+    DEFAULT_THRESHOLD,
+    InvalidFeatureValueError,
+    PredictionService,
+    UnknownFeatureError,
+)
 
 INTEGRITY_FAILURE = "PROVENANCE_INTEGRITY_FAILURE"
 FLUSH_INTERVAL_SECONDS = 5.0
@@ -92,10 +97,8 @@ def create_app(
     """Build the app. Arguments override the environment, for tests and embedding."""
     resolved_root = Path(root) if root is not None else glassbox_root()
     resolved_version = model_version_id or os.environ.get(MODEL_VERSION_ENV)
-    resolved_threshold = (
-        threshold
-        if threshold is not None
-        else float(os.environ.get(THRESHOLD_ENV, DEFAULT_THRESHOLD))
+    resolved_threshold = _validated_threshold(
+        threshold if threshold is not None else os.environ.get(THRESHOLD_ENV, DEFAULT_THRESHOLD)
     )
 
     @asynccontextmanager
@@ -145,7 +148,10 @@ def create_app(
 
         try:
             outcome = await asyncio.to_thread(service.predict, payload, subject_id=subject_id)
-        except UnknownFeatureError as exc:
+        except (UnknownFeatureError, InvalidFeatureValueError) as exc:
+            # 422, not 500: the request is the thing that is wrong. A malformed
+            # value reported as a server error sends someone to investigate a
+            # system that is behaving correctly.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ProvenanceIntegrityError as exc:
             raise _integrity_failure(exc) from exc
@@ -182,6 +188,33 @@ def create_app(
         return report.to_dict()
 
     return app
+
+
+def _validated_threshold(value: Any) -> float:
+    """Parse and range-check the decision threshold, at app creation.
+
+    The threshold is compared against ``predict_proba``, so anything outside
+    ``[0, 1]`` is not a strict policy — it is a constant decision, recorded on
+    every audit row as though a model had produced it. ``GLASSBOX_THRESHOLD=high``
+    used to raise a bare ValueError out of ``float()`` during startup, and
+    ``GLASSBOX_THRESHOLD=50`` (percent, plausibly) was accepted and denied
+    everyone. Both are caught here, at the one moment there is still a human
+    reading the output.
+    """
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{THRESHOLD_ENV} must be a number in [0, 1], got {value!r}"
+        ) from exc
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"{THRESHOLD_ENV}={threshold!r} is outside [0, 1]; a threshold outside "
+            f"the range of predict_proba does not tighten the policy, it decides "
+            f"every case the same way while the audit trail records a score that "
+            f"never mattered"
+        )
+    return threshold
 
 
 def _lookup(service: PredictionService, prediction_id: str, top_k: int, *, flush_on_miss: bool):

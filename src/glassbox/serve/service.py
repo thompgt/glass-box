@@ -47,6 +47,18 @@ APPROVE = "approve"
 DENY = "deny"
 
 
+class InvalidFeatureValueError(ValueError):
+    """A known feature carried a value that cannot be what it claims to be.
+
+    Distinct from :class:`UnknownFeatureError` because the caller's mistake is
+    different — the field exists, its value does not parse — but the status is
+    the same, and the important part is that both are the *caller's* mistake.
+    Letting ``float("old")`` escape as a bare ValueError made a malformed
+    request indistinguishable from a broken server, which sends whoever gets
+    paged looking at the wrong system.
+    """
+
+
 class UnknownFeatureError(ValueError):
     """The request carried a field the model has no place for.
 
@@ -176,7 +188,15 @@ class PredictionService:
         row: dict[str, Any] = {}
         for column in F.NUMERIC_FEATURES:
             value = payload.get(column)
-            row[column] = 0.0 if value is None else float(value)
+            if value is None:
+                row[column] = 0.0
+                continue
+            try:
+                row[column] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise InvalidFeatureValueError(
+                    f"feature {column!r} must be a number, got {value!r}"
+                ) from exc
         for column in F.CATEGORICAL_FEATURES:
             value = payload.get(column)
             # OneHotEncoder was fit with handle_unknown="ignore", so an unseen
