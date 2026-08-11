@@ -22,6 +22,12 @@ data/raw/
 data/*.csv
 data/*.parquet
 
+# Demo scratch roots. `GLASSBOX_ROOT=gbdemo glassbox init` builds a complete
+# throwaway root — data, warehouse, catalog — and every byte of it is
+# regenerable, so none of it belongs in the repository.
+gbdemo/
+*/data/raw/
+
 # Benchmarks / demo output
 bench/results/*.json
 demo/out/
